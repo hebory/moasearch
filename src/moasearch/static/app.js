@@ -1,0 +1,111 @@
+(() => {
+  'use strict';
+  const token = document.querySelector('meta[name="moasearch-token"]')?.content || '';
+  const $ = (selector, scope = document) => scope.querySelector(selector);
+  const dom = Object.fromEntries(['root-list','add-root','add-folder-welcome','rescan-top','index-progress','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-progress','download-progress-fill','download-progress-text','toast'].map(id => [id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), document.getElementById(id)]));
+  const state = {roots:[], status:null, results:[], selected:null, mode:'hybrid', query:'', extension:'', searchTimer:0, pollTimer:0, toastTimer:0, searchSequence:0, answerSequence:0, addingRoot:false, reportedIndexError:'', modelDownload:null, modelDownloadKind:'', reportedDownloadError:''};
+  const esc = value => String(value ?? '');
+  function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = esc(text); return node; }
+  async function api(path, {method='GET',body}={}) {
+    const headers = {'X-MoaSearch-Token':token};
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    let response;
+    try { response = await fetch(path,{method,headers,body:body === undefined ? undefined : JSON.stringify(body),credentials:'same-origin'}); }
+    catch { throw new Error('앱에 연결할 수 없어요. 모아검색 창이 열려 있는지 확인해 주세요.'); }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || `요청을 완료하지 못했어요 (${response.status}).`);
+    return data;
+  }
+  function toast(message,error=false) { clearTimeout(state.toastTimer); dom.toast.textContent=message;dom.toast.classList.toggle('error',error);dom.toast.classList.add('show');state.toastTimer=setTimeout(()=>dom.toast.classList.remove('show'),3600); }
+  function fmtBytes(size) { const n=Number(size)||0;if(n<1024)return `${n} B`;if(n<1024**2)return `${(n/1024).toFixed(0)} KB`;if(n<1024**3)return `${(n/1024**2).toFixed(1)} MB`;return `${(n/1024**3).toFixed(1)} GB`; }
+  function fmtDate(value) { if(value===null||value===undefined||value==='')return '';let date;if(typeof value==='number'||/^\d{15,}$/.test(String(value))){const numeric=Number(value);date=new Date(Math.abs(numeric)>=1e14?numeric/1e6:numeric);}else date=new Date(value);return Number.isNaN(date.getTime())?String(value):new Intl.DateTimeFormat('ko-KR',{year:'numeric',month:'short',day:'numeric'}).format(date); }
+  function fileIcon(ext) { const type=(ext||'file').replace(/^\./,'').toLowerCase();const box=element('span','file-icon',type.slice(0,5).toUpperCase());box.dataset.type=type;box.setAttribute('aria-hidden','true');return box; }
+  function humanPath(path) { return esc(path).replaceAll('\\','\\'); }
+  function renderRoots(roots) {
+    state.roots=roots||[];dom.rootList.replaceChildren();
+    if(!state.roots.length){dom.rootList.append(element('div','root-empty','아직 추가한 위치가 없어요'));return;}
+    for(const root of state.roots){const row=element('div','root-item');row.title=esc(root.path);const icon=element('span','root-icon','▱');icon.setAttribute('aria-hidden','true');const path=element('span','root-path',root.path);const remove=element('button','icon-button root-remove','×');remove.type='button';remove.setAttribute('aria-label',`${root.path} 검색 위치 제거`);remove.title='검색 위치 제거';remove.addEventListener('click',async event=>{event.stopPropagation();try{await api(`/api/roots/${encodeURIComponent(root.id)}`,{method:'DELETE'});await refreshStatus();toast('검색 위치를 제거했어요.');}catch(error){toast(error.message,true);}});row.append(icon,path,remove);dom.rootList.append(row);}
+  }
+  function renderStatus(data) {
+    state.status=data;const counts=data.counts||{},index=data.index||{},engine=data.engine||{},settings=data.settings||{};
+    renderRoots(data.roots||[]);
+    const ready=Boolean(engine.embedding_ready);dom.engineCard.classList.toggle('ready',ready);dom.engineCard.classList.toggle('waiting',!ready);
+    dom.engineTitle.textContent=ready?(engine.chat_ready?'로컬 AI 준비 완료':'의미 검색 준비 완료'):'키워드 검색 사용 가능';
+    dom.engineMessage.textContent=engine.message|| (ready?'파일이 내 PC에서 안전하게 처리돼요':'모델을 설정하면 의미로 검색해요');
+    const running=Boolean(index.running);dom.indexProgress.hidden=!running;
+    if(running){const scanned=Number(index.scanned)||0,indexed=Number(index.indexed)||0;dom.progressLabel.textContent=index.phase==='watch'?'변경 파일 확인 중':`파일을 살펴보고 있어요 · ${indexed}개 저장`;dom.progressDetail.textContent=index.current_path?`${humanPath(index.current_path)} · ${scanned}개 확인`:`${scanned}개 파일 확인 · ${Number(index.errors)||0}개 읽기 건너뜀`;}
+    dom.librarySummary.textContent=`파일 ${Number(counts.files)||0}개 · 내용 조각 ${Number(counts.chunks)||0}개`+(ready?` · 벡터 ${Number(counts.vectors)||0}개`:'');
+    const hasRoots=state.roots.length>0;dom.welcome.hidden=hasRoots;dom.resultsView.hidden=!hasRoots||!state.query;
+    dom.libraryIdle.hidden=!hasRoots||Boolean(state.query);if(hasRoots&&!state.query){const hasFiles=(Number(counts.files)||0)>0;dom.idleTitle.textContent=hasFiles?'라이브러리를 검색할 준비가 됐어요':'검색 위치를 연결했어요';dom.idleMessage.textContent=hasFiles?`파일 ${Number(counts.files)||0}개가 준비됐어요. 이름이나 내용으로 찾아보세요.`:'색인을 시작하면 파일 이름과 문서 내용을 검색할 수 있어요.';dom.startIndexEmpty.hidden=hasFiles||running;}
+    if(index.last_error&&!running&&index.last_error!==state.reportedIndexError){state.reportedIndexError=index.last_error;toast(index.last_error,true);}else if(!index.last_error)state.reportedIndexError='';
+    renderModelDownload(data.model_download||{});
+    schedulePoll(running||state.modelDownload?.running?2800:12000);
+  }
+  function renderModelDownload(download={}) {
+    state.modelDownload=download;
+    const running=Boolean(download.running);dom.downloadEmbedding.disabled=running;dom.downloadChat.disabled=running;const save=dom.settingsForm.querySelector('[type="submit"]');if(save)save.disabled=running;
+    dom.downloadProgress.hidden=!running&&!download.error;
+    if(running){const received=Number(download.received)||0,total=Number(download.total)||0;const bytes=total?`${fmtBytes(received)} / ${fmtBytes(total)}`:`${fmtBytes(received)} 받음`;dom.downloadProgress.classList.add('running');dom.downloadProgressText.textContent=`${download.kind==='chat'?'답변 모델':'임베딩 모델'} · ${bytes} · ${download.message||'다운로드 중'}`;if(download.kind==='embedding')dom.settingsForm.elements.namedItem('embedding_model').dataset.downloadKind='embedding';if(download.kind==='chat')dom.settingsForm.elements.namedItem('chat_model').dataset.downloadKind='chat';return;}
+    dom.downloadProgress.classList.remove('running');
+    if(download.error){dom.downloadProgressText.textContent=download.error;dom.downloadProgress.hidden=false;if(download.error!==state.reportedDownloadError){state.reportedDownloadError=download.error;dom.settingsFeedback.textContent=download.error;}return;}
+    if(state.modelDownloadKind){const kind=state.modelDownloadKind;const key=kind==='chat'?'chat_model':'embedding_model';const input=dom.settingsForm.elements.namedItem(key);const saved=state.status?.settings?.[key]||'';if(input&&!input.value&&saved)input.value=saved;dom.downloadProgress.hidden=true;dom.settingsFeedback.textContent=saved?`${kind==='chat'?'답변':'임베딩'} 모델을 설치하고 경로를 저장했어요.${input?.value===saved?'':' 입력 중인 경로는 유지했어요. 설정 저장을 눌러 경로를 적용하세요.'}`:'모델을 받았어요. 모델 경로를 확인한 뒤 설정을 저장해 주세요.';state.modelDownloadKind='';}
+  }
+  function schedulePoll(delay) { clearTimeout(state.pollTimer);state.pollTimer=setTimeout(refreshStatus,delay); }
+  async function refreshStatus() { try{renderStatus(await api('/api/status'));}catch(error){schedulePoll(10000);if(!state.status)renderRoots([]);console.warn('status',error.message);} }
+  function fillSettings(settings={}) { for(const key of ['embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb']){const input=dom.settingsForm.elements.namedItem(key);if(input&&document.activeElement!==input&&settings[key]!==undefined)input.value=settings[key];} }
+  async function chooseRoot() {
+    if(state.addingRoot)return;
+    const suggested=state.status?.suggestions||[];let value='';
+    if(suggested.length){const picks=suggested.map((item,i)=>`${i+1}. ${item.label}  —  ${item.path}`).join('\n');value=window.prompt(`검색할 폴더 경로를 입력해 주세요.\n\n자주 쓰는 폴더:\n${picks}\n\n예: C:\\Users\\내이름\\Documents`,'');}
+    else value=window.prompt('검색할 폴더의 전체 경로를 입력해 주세요.\n예: C:\\Users\\내이름\\Documents','');
+    if(value===null)return;const selected=value.trim();if(!selected){toast('폴더 경로를 입력해 주세요.',true);return;}
+    const suggestionMatch=selected.match(/^(?:#\s*)?(\d+)$/);const suggestionIndex=suggestionMatch?Number(suggestionMatch[1])-1:-1;const path=suggestionIndex>=0&&suggestionIndex<suggested.length?suggested[suggestionIndex].path:selected;
+    try{state.addingRoot=true;dom.addRoot.disabled=true;dom.addFolderWelcome.disabled=true;await api('/api/roots',{method:'POST',body:{path}});await refreshStatus();toast('검색 위치를 추가했어요. 지금 색인을 시작할 수 있어요.');}
+    catch(error){toast(error.message,true);}finally{state.addingRoot=false;dom.addRoot.disabled=false;dom.addFolderWelcome.disabled=false;}
+  }
+  async function startIndex(){try{await api('/api/index',{method:'POST',body:{}});await refreshStatus();toast('색인을 시작했어요.');}catch(error){toast(error.message,true);}}
+  async function cancelIndex(){try{await api('/api/index/cancel',{method:'POST',body:{}});await refreshStatus();toast('색인을 정리하고 있어요.');}catch(error){toast(error.message,true);}}
+  async function downloadModel(kind){if(state.modelDownload?.running)return;state.modelDownloadKind=kind;state.reportedDownloadError='';const label=kind==='chat'?'답변':'임베딩';dom.settingsFeedback.textContent=`${label} GGUF 모델 다운로드를 요청했어요. 준비 중입니다…`;try{await api('/api/models/download',{method:'POST',body:{kind}});await refreshStatus();toast(`${label} 모델 다운로드를 시작했어요.`);}catch(error){state.modelDownloadKind='';dom.settingsFeedback.textContent=error.message;toast(error.message,true);}}
+  async function search() {
+    const query=dom.query.value.trim();state.query=query;const sequence=++state.searchSequence;state.answerSequence++;dom.answerView.hidden=true;if(!query){state.results=[];state.selected=null;dom.resultsView.hidden=true;return;}
+    state.selected=null;dom.welcome.hidden=true;dom.libraryIdle.hidden=true;dom.resultsView.hidden=false;dom.resultsTitle.textContent='검색 중…';dom.resultsList.replaceChildren(element('div','results-empty','파일을 찾고 있어요…'));renderPreviewPlaceholder();
+    const payload={query,limit:30,extension:state.extension||null,mode:state.mode};
+    try{const data=await api('/api/search',{method:'POST',body:payload});if(sequence!==state.searchSequence||dom.query.value.trim()!==query)return;state.results=data.results||[];dom.resultsTitle.textContent=state.results.length?`“${query}”의 결과 ${state.results.length}개`:'찾은 파일이 없어요';renderResults(data);}
+    catch(error){if(sequence!==state.searchSequence||dom.query.value.trim()!==query)return;dom.resultsTitle.textContent='검색하지 못했어요';dom.resultsList.replaceChildren(element('div','results-empty',error.message));toast(error.message,true);}
+  }
+  function renderResults(data={}) {
+    dom.resultsList.replaceChildren();dom.answerView.hidden=true;
+    if(data.warnings?.length)dom.resultsList.append(element('div','search-hint-inline',data.warnings.join(' · ')));
+    if(!state.results.length){const empty=element('div','results-empty','다른 단어로 다시 검색하거나 검색 위치를 추가해 보세요.');dom.resultsList.append(empty);state.selected=null;renderPreviewPlaceholder();return;}
+    for(const result of state.results){const card=element('article','result-card'+(state.selected?.id===result.id?' selected':''));card.setAttribute('role','listitem');card.setAttribute('tabindex','0');card.setAttribute('aria-label',`${result.name}, ${result.path}`);card.append(fileIcon(result.extension));const body=element('div','result-body');const titleRow=element('div','result-title-row');titleRow.append(element('span','result-title',result.name));body.append(titleRow,element('div','result-path',result.path));if(result.snippet)body.append(element('div','result-snippet',result.snippet));const meta=element('div','result-meta');meta.append(element('span','',fmtBytes(result.size)),element('span','',fmtDate(result.modified)));const matchType=String(result.match_type||'');const semantic=matchType.includes('semantic'),keyword=matchType.includes('keyword');const matchLabel=semantic&&keyword?'의미 + 키워드':semantic?'의미 일치':keyword?'본문 일치':'이름 일치';const match=element('span','match-tag'+(!semantic&&keyword?' keyword':''),matchLabel);meta.append(match);if(result.location)meta.append(element('span','',result.location));body.append(meta);card.append(body);const select=()=>selectResult(result,card);card.addEventListener('click',select);card.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();select();}});dom.resultsList.append(card);}
+    if(!state.selected||!state.results.some(r=>r.id===state.selected.id)){selectResult(state.results[0],$('.result-card',dom.resultsList));}
+  }
+  function renderPreviewPlaceholder(message='파일을 선택해 주세요') {dom.preview.replaceChildren();const empty=element('div','preview-empty');const icon=element('span','preview-empty-icon');icon.innerHTML='<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M8 4.5h10l7 7v16H8z"/><path d="M18 4.5v7h7M12 17h9M12 21h9"/></svg>';empty.append(icon,element('strong','',message),element('span','',message==='파일을 선택해 주세요'?'내용과 위치를 여기서 확인할 수 있어요.':''));dom.preview.append(empty);}
+  async function selectResult(result,card) {
+    state.selected=result;for(const item of dom.resultsList.querySelectorAll('.result-card'))item.classList.toggle('selected',item===card);
+    dom.preview.replaceChildren(element('div','preview-spinner','파일 내용을 불러오는 중…'));
+    try{const file=await api(`/api/files/${encodeURIComponent(result.id)}`);if(state.selected?.id!==result.id)return;renderPreview(file);}
+    catch(error){if(state.selected?.id===result.id){renderPreviewPlaceholder('파일 정보를 불러오지 못했어요');dom.preview.append(element('div','preview-error',error.message));}}
+  }
+  function renderPreview(file) {
+    dom.preview.replaceChildren();const head=element('div','preview-file-head');head.append(fileIcon(file.extension));const info=element('div','result-body');info.append(element('div','preview-file-title',file.name),element('div','preview-file-path',file.path));head.append(info);dom.preview.append(head);
+    const metadata=element('div','preview-meta');metadata.append(element('span','',fmtBytes(file.size)),element('span','',fmtDate(file.modified)),element('span','',file.extension?`.${String(file.extension).replace(/^\./,'')}`:'파일'));dom.preview.append(metadata);
+    const actions=element('div','preview-actions');const open=element('button','secondary-button','파일 열기');open.type='button';open.addEventListener('click',()=>fileAction(file.id,'open'));const reveal=element('button','secondary-button','폴더에서 보기');reveal.type='button';reveal.addEventListener('click',()=>fileAction(file.id,'reveal'));actions.append(open,reveal);dom.preview.append(actions);
+    if(file.error)dom.preview.append(element('div','preview-error',file.error));
+    if(file.passages?.length){dom.preview.append(element('div','preview-section-title',`파일 내용 · ${file.passages.length}개 구간`));const list=element('div','passage-list');for(const passage of file.passages){const card=element('div','passage-card');if(passage.location)card.append(element('div','passage-location',passage.location));card.append(element('div','passage-text',passage.text));list.append(card);}dom.preview.append(list);}
+    else if(!file.error)dom.preview.append(element('div','preview-spinner','내용이 없거나 색인이 아직 진행 중이에요.'));
+  }
+  async function fileAction(id,action){try{await api(`/api/files/${encodeURIComponent(id)}/${action}`,{method:'POST',body:{}});}catch(error){toast(error.message,true);}}
+  async function askAnswer(){const query=state.query.trim();if(!query)return;const sequence=++state.answerSequence;dom.answerView.hidden=false;dom.answerText.textContent='내 파일에서 근거를 살펴보고 있어요…';dom.answerSources.replaceChildren();dom.answerState.textContent='생성 중';dom.answerView.scrollIntoView({behavior:'smooth',block:'nearest'});try{const data=await api('/api/answer',{method:'POST',body:{query,limit:5}});if(sequence!==state.answerSequence||state.query!==query)return;dom.answerText.textContent=data.answer||'검색된 내용에서 답변을 만들 수 없었어요.';dom.answerState.textContent='내 파일에서 답변';dom.answerSources.replaceChildren();for(const source of data.sources||[]){const chip=element('button','source-chip',`${source.name}${source.location?` · ${source.location}`:''}`);chip.type='button';chip.title=source.path;chip.addEventListener('click',()=>{const result=state.results.find(r=>String(r.id)===String(source.id));if(result){dom.preview.scrollIntoView({behavior:'smooth',block:'center'});selectResult(result,Array.from(dom.resultsList.querySelectorAll('.result-card')).find((_,i)=>state.results[i]?.id===result.id));}});dom.answerSources.append(chip);}for(const warning of data.warnings||[])dom.answerSources.append(element('span','source-chip',warning));}
+    catch(error){if(sequence!==state.answerSequence||state.query!==query)return;dom.answerText.textContent=error.message;dom.answerState.textContent='모델 확인 필요';}}
+  function submitSearch(){clearTimeout(state.searchTimer);search();}
+  dom.addRoot.addEventListener('click',chooseRoot);dom.addFolderWelcome.addEventListener('click',chooseRoot);dom.rescanTop.addEventListener('click',startIndex);dom.startIndexEmpty.addEventListener('click',startIndex);dom.cancelIndex.addEventListener('click',cancelIndex);dom.openSettings.addEventListener('click',()=>{fillSettings(state.status?.settings||{});dom.settingsFeedback.textContent='';dom.settingsDialog.showModal();});
+  dom.searchForm.addEventListener('submit',event=>{event.preventDefault();submitSearch();});dom.query.addEventListener('input',()=>{clearTimeout(state.searchTimer);state.answerSequence++;if(dom.query.value.trim())state.searchTimer=setTimeout(search,500);else{state.query='';state.searchSequence++;state.results=[];state.selected=null;dom.resultsView.hidden=true;dom.answerView.hidden=true;dom.welcome.hidden=state.roots.length>0;}});
+  document.querySelectorAll('.mode-button').forEach(button=>button.addEventListener('click',()=>{state.mode=button.dataset.mode;document.querySelectorAll('.mode-button').forEach(item=>{const active=item===button;item.classList.toggle('active',active);item.setAttribute('aria-pressed',String(active));});if(state.query)submitSearch();}));
+  dom.extensionFilter.addEventListener('change',()=>{state.extension=dom.extensionFilter.value;if(state.query)submitSearch();});dom.answerRequest.addEventListener('click',askAnswer);
+  dom.resultsList.addEventListener('dblclick',event=>{const card=event.target.closest('.result-card');if(!card||!state.selected)return;fileAction(state.selected.id,'open');});
+  dom.settingsForm.addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(dom.settingsForm);const settings={embedding_model:String(form.get('embedding_model')||'').trim(),chat_model:String(form.get('chat_model')||'').trim(),n_gpu_layers:Number(form.get('n_gpu_layers')),context_size:Number(form.get('context_size')),scan_interval:Number(form.get('scan_interval')),max_file_mb:Number(form.get('max_file_mb'))};const save=dom.settingsForm.querySelector('[type="submit"]');save.disabled=true;dom.settingsFeedback.textContent='저장하고 있어요…';try{await api('/api/settings',{method:'PATCH',body:settings});await refreshStatus();dom.settingsFeedback.textContent='설정을 저장했어요. 색인을 시작하면 내용이 등록돼요.';}catch(error){dom.settingsFeedback.textContent=error.message;}finally{save.disabled=Boolean(state.modelDownload?.running);}});
+  dom.downloadEmbedding.addEventListener('click',()=>downloadModel('embedding'));dom.downloadChat.addEventListener('click',()=>downloadModel('chat'));
+  document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();dom.query.focus();}if(event.key==='Escape'&&dom.settingsDialog.open)dom.settingsDialog.close();});
+  refreshStatus();
+})();
