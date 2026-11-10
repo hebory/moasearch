@@ -136,9 +136,14 @@ class Indexer:
                         if passages and model_id and not self._cancel.is_set():
                             try:
                                 self._update(phase="embedding")
-                                vectors = self.engine.embed([p.text for p in passages])
+                                vectors = []
+                                for offset in range(0, len(passages), 4):
+                                    if self._cancel.is_set():
+                                        break
+                                    vectors.extend(self.engine.embed([p.text for p in passages[offset:offset + 4]]))
                             except Exception as exc:
                                 self._error(f"의미 색인 실패, 본문은 저장합니다: {exc}")
+                                vectors = None
                                 model_id = None  # Avoid repeating a model failure for every file in this pass.
                             finally:
                                 self._update(phase="scanning")

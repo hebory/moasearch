@@ -10,7 +10,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "numpy>=2.1,<3", "pypdf>=5,<7"]
 
 [project.optional-dependencies]
-ai = ["llama-cpp-python>=0.3.16,<0.4"]
+ai = ["llama-cpp-python==0.3.36"]
 test = ["httpx>=0.28,<1"]
 
 [project.scripts]
@@ -21,4 +21,12 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 moasearch = ["static/*"]
+
+[tool.uv.sources]
+llama-cpp-python = { index = "llama-cpu" }
+
+[[tool.uv.index]]
+name = "llama-cpu"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+explicit = true
 
