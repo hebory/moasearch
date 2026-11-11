@@ -1,0 +1,2 @@
+# Preserve upstream license bytes so recorded SHA-256 values survive checkout.
+packaging/license-overrides/** -text

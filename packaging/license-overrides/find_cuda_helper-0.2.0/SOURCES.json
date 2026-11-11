@@ -1,0 +1,16 @@
+{
+  "package": "find_cuda_helper-0.2.0",
+  "provenance": "Cargo declares repository Rust-GPU/Rust-CUDA and SPDX MIT OR Apache-2.0. Published crate omitted VCS SHA/license files; exact upstream root license files captured at inspected official commit 3a82c35a7196731fb60eebdac2a40d2b1bf0ba95 (not claimed to be unpublished package commit).",
+  "licenses": [
+    {
+      "file": "LICENSE-MIT",
+      "sourceUrl": "https://raw.githubusercontent.com/Rust-GPU/Rust-CUDA/3a82c35a7196731fb60eebdac2a40d2b1bf0ba95/LICENSE-MIT",
+      "sha256": "b47387386076db46382e2e37ca7d4fbbc85b77a5464a1666314a4a6eda6dd8a5"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sourceUrl": "https://raw.githubusercontent.com/Rust-GPU/Rust-CUDA/3a82c35a7196731fb60eebdac2a40d2b1bf0ba95/LICENSE-APACHE",
+      "sha256": "c1753dcc4e00c4caa891682eec700640e1a0e50bf96802daad12cf30eea942fe"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "package": "oar-ocr-derive-0.10.2",
+  "provenance": "Cargo registry .cargo_vcs_info.json pins GreatV/oar-ocr commit 16ee0599a12a477178b8495918f99e1ed92e5e4e, path oar-ocr-derive.",
+  "licenses": [
+    {
+      "file": "LICENSE",
+      "sourceUrl": "https://raw.githubusercontent.com/GreatV/oar-ocr/16ee0599a12a477178b8495918f99e1ed92e5e4e/LICENSE",
+      "sha256": "8a7ec3e5de8c98ead49da38ca820edb995102e95093da040b304413e37b6c607"
+    }
+  ]
+}

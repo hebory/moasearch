@@ -1,10 +1,22 @@
 # 모아검색
 
+![모아검색 — 내 파일을 위한 검색](cover.png)
+
 내 PC의 파일 이름과 문서 내용을 한국어로 검색하는 Windows용 **Rust 앱**입니다. 선택한 폴더를 SQLite에 색인하고, Google EmbeddingGemma 2로 자연어 검색하며, Google Gemma 4 E2B로 검색한 문서를 근거로 답변합니다.
 
 Python·Ollama·별도 AI 서버는 필요하지 않습니다. Rust 실행 파일에 연결한 llama.cpp가 모델을 같은 프로세스에서 실행합니다. 화면은 앱이 여는 `http://127.0.0.1:8765`에서 사용합니다. 모델 설치 후 문서 처리·검색·추론은 인터넷 없이 동작합니다.
 
-## 실행
+## 설치와 모아런처 등록
+
+[최신 GitHub Release](https://github.com/hebory/moasearch/releases/latest)에서 Windows x64 설치 파일(`*-setup.exe`) 또는 포터블 ZIP을 받을 수 있습니다. Python·Rust 개발 도구 없이 실행하며, 필요한 네이티브 런타임을 패키지에 포함합니다. 설치 파일과 앱 데이터는 분리하고, 설치 제거 시 색인과 모델을 보존합니다.
+
+모아런처에서는 Release의 **`moalauncher.json`**을 내려받은 뒤 **설정 → 카탈로그 가져오기**에서 선택하세요. `hebory/moasearch` 저장소, 설치 파일 패턴과 아이콘·커버 주소가 함께 등록됩니다. JSON을 가져오는 것만으로 설치되지는 않으며, 추가한 모아검색 카드에서 설치를 누릅니다.
+
+처음 실행하면 앱의 **AI 설정**에서 Google 임베딩·답변 모델과 OCR 모델을 준비하세요. 모델 합계 약 3.68 GB는 설치 패키지에 포함하지 않습니다. 모델 없이도 파일명·일반 문서 키워드 검색을 사용할 수 있습니다.
+
+등록 형식과 패키지 재현 방법은 [릴리스 문서](docs/releasing.md), 이미지 원본과 생성 프롬프트는 [이미지 문서](docs/artwork.md)에 있습니다.
+
+## 소스에서 실행
 
 이미 빌드된 `dist\moasearch.exe`가 있으면 `start.cmd`를 실행합니다. 실행 파일은 화면 리소스와 SQLite·llama.cpp를 포함합니다. OCR은 Rust OAR/ONNX Runtime, PDF 렌더링은 Windows 기본 기능을 사용합니다. 실행 파일 옆의 ONNX Runtime DLL도 함께 유지하세요.
 
