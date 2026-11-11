@@ -50,6 +50,8 @@ class Store:
         paths_exist = db.execute("SELECT 1 FROM sqlite_master WHERE name='files_fts'").fetchone()
         schema = """
             CREATE INDEX IF NOT EXISTS chunks_model ON chunks(model_id,file_id) WHERE vector IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS chunks_file_text ON chunks(file_id,text,location);
+            CREATE INDEX IF NOT EXISTS files_modified ON files(modified DESC);
             CREATE INDEX IF NOT EXISTS files_extension ON files(extension,modified DESC);
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                 path, content='files', content_rowid='id', tokenize='trigram');
