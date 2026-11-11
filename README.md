@@ -92,6 +92,16 @@ cargo run --release --example benchmark -- --files 5000
 
 자동 테스트는 임시 가상 문서와 가짜 임베딩을 사용합니다. 별도 실제 모델·OCR 검증은 생성한 예제만 읽도록 분리합니다. [구조와 전환](docs/architecture.md), [성능 기록](docs/performance.md)을 참고하세요. 성능 기록의 Python 측정값과 Rust 측정값은 구분합니다.
 
+실제 모델 검증은 준비된 모델 폴더를 지정합니다. 아래 경로를 자신의 모델 설치 위치로 바꿀 수 있습니다.
+
+```powershell
+.\build.ps1 -PrepareOnly
+$env:MOASEARCH_OCR_MODELS = "$PWD\.moasearch-rust-dev\models"
+cargo test --release --locked --test rust_formats -- --ignored
+cargo run --release --locked --example smoke_ai -- .moasearch-verify-ai .moasearch-rust-dev/models
+cargo run --release --locked --example smoke_formats -- .moasearch-verify-formats .moasearch-rust-dev/models
+```
+
 ## 모델·구현 출처
 
 - [Google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), [llama.cpp용 Q8_0 변환](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF): 텍스트 의미 검색, 약 310 MB.

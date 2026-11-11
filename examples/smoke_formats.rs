@@ -31,7 +31,37 @@ fn main() -> Result<()> {
         }
     }
     store.update_settings(&json!({"embedding_model":config::canonical(&model_dir.join(models::EMBEDDING.filename))?,"scan_interval":0}))?;
-    let fixture = config::canonical(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"))?;
+    // Index only the five documents. The fixture README describes their answers
+    // and would otherwise contaminate the retrieval regression corpus.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let inputs = data.with_extension("fixtures");
+    std::fs::create_dir_all(&inputs)?;
+    for name in [
+        "hwp-aurora.hwp",
+        "hwpx-cyan.hwpx",
+        "receipt.png",
+        "meeting.pdf",
+        "rental.pdf",
+    ] {
+        let target = inputs.join(name);
+        if target.exists() {
+            ensure!(
+                std::fs::read(&target)? == std::fs::read(source.join(name))?,
+                "기존 검증 파일이 다릅니다. 새 데이터 폴더로 실행하세요: {}",
+                target.display()
+            );
+        } else {
+            std::fs::copy(source.join(name), target)?;
+        }
+    }
+    let fixture = config::canonical(&inputs)?;
+    ensure!(
+        store
+            .roots()?
+            .iter()
+            .all(|r| r["path"].as_str() == fixture.to_str()),
+        "별도 새 검증 데이터 폴더로 실행하세요."
+    );
     if !store
         .roots()?
         .iter()
