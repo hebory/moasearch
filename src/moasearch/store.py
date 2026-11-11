@@ -1,4 +1,4 @@
-"""SQLite index. Each operation owns its connection; source files are never written."""
+"""SQLite index with bounded batch writes and transactional search revisions."""
 
 from contextlib import contextmanager
 import json
@@ -43,6 +43,61 @@ class Store:
             file_columns = {row["name"] for row in db.execute("PRAGMA table_info(files)")}
             if "reader_id" not in file_columns:
                 db.execute("ALTER TABLE files ADD COLUMN reader_id TEXT NOT NULL DEFAULT 'legacy-v1'")
+            self._prepare_search_metadata(db)
+
+    @staticmethod
+    def _prepare_search_metadata(db):
+        paths_exist = db.execute("SELECT 1 FROM sqlite_master WHERE name='files_fts'").fetchone()
+        schema = """
+            CREATE INDEX IF NOT EXISTS chunks_model ON chunks(model_id,file_id) WHERE vector IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS files_extension ON files(extension,modified DESC);
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                path, content='files', content_rowid='id', tokenize='trigram');
+            CREATE TABLE IF NOT EXISTS index_meta (
+                id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,
+                files INTEGER NOT NULL, chunks INTEGER NOT NULL, vectors INTEGER NOT NULL);
+            INSERT INTO index_meta SELECT 1,0,
+                (SELECT count(*) FROM files), (SELECT count(*) FROM chunks),
+                (SELECT count(*) FROM chunks WHERE vector IS NOT NULL)
+                WHERE NOT EXISTS (SELECT 1 FROM index_meta WHERE id=1);
+        """
+        # Keep counters and invalidation in the same transaction as the actual
+        # rows, including writes from a second app/CLI process and FK cascades.
+        schema += """
+            CREATE TRIGGER IF NOT EXISTS files_search_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid,path) VALUES(new.id,new.path);
+                UPDATE index_meta SET revision=revision+1,files=files+1 WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_search_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts,rowid,path) VALUES('delete',old.id,old.path);
+                UPDATE index_meta SET revision=revision+1,files=files-1 WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_search_au AFTER UPDATE ON files BEGIN
+                UPDATE index_meta SET revision=revision+1 WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_path_au AFTER UPDATE OF path ON files
+            WHEN old.path != new.path BEGIN
+                INSERT INTO files_fts(files_fts,rowid,path) VALUES('delete',old.id,old.path);
+                INSERT INTO files_fts(rowid,path) VALUES(new.id,new.path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_meta_ai AFTER INSERT ON chunks BEGIN
+                UPDATE index_meta SET revision=revision+1,chunks=chunks+1,
+                    vectors=vectors+(new.vector IS NOT NULL) WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_meta_ad AFTER DELETE ON chunks BEGIN
+                UPDATE index_meta SET revision=revision+1,chunks=chunks-1,
+                    vectors=vectors-(old.vector IS NOT NULL) WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_meta_au AFTER UPDATE ON chunks BEGIN
+                UPDATE index_meta SET revision=revision+1,
+                    vectors=vectors+(new.vector IS NOT NULL)-(old.vector IS NOT NULL) WHERE id=1;
+            END;
+        """
+        if not paths_exist:
+            schema += "INSERT INTO files_fts(files_fts) VALUES('rebuild');\n"
+        # Migration itself is atomic: another indexing process cannot change
+        # rows between the initial counts and installation of the triggers.
+        db.executescript("BEGIN IMMEDIATE;\n" + schema + "COMMIT;")
 
     @contextmanager
     def connect(self):
@@ -101,15 +156,20 @@ class Store:
             db.execute("DELETE FROM roots WHERE id=?", (root_id,))
 
     def counts(self):
-        with self.connect() as db:
-            return {"files": db.execute("SELECT count(*) FROM files").fetchone()[0],
-                    "chunks": db.execute("SELECT count(*) FROM chunks").fetchone()[0],
-                    "vectors": db.execute("SELECT count(*) FROM chunks WHERE vector IS NOT NULL").fetchone()[0]}
+        return {key: value for key, value in self.index_state().items() if key != "revision"}
 
-    def file_by_path(self, path):
+    def index_state(self, db=None):
+        if db is not None:
+            return dict(db.execute("SELECT revision,files,chunks,vectors FROM index_meta WHERE id=1").fetchone())
         with self.connect() as db:
+            return self.index_state(db)
+
+    def file_by_path(self, path, db=None):
+        if db is not None:
             row = db.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
             return dict(row) if row else None
+        with self.connect() as db:
+            return self.file_by_path(path, db)
 
     def file(self, file_id):
         with self.connect() as db:
@@ -122,20 +182,39 @@ class Store:
     def replace_file(self, root_id, path, stat, passages, vectors=None, model_id=None, error=None,
                      reader_id="legacy-v1"):
         with self.connect() as db:
-            db.execute("""INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id,reader_id)
+            self._replace_file(db, root_id, path, stat, passages, vectors, model_id, error, reader_id)
+
+    def replace_files(self, records, db=None):
+        """Atomically publish completed files; never hold a transaction during OCR."""
+        if db is None:
+            with self.connect() as connection:
+                self.replace_files(records, connection)
+            return
+        with db:
+            for record in records:
+                self._replace_file(db, **record)
+
+    @staticmethod
+    def _replace_file(db, root_id, path, stat, passages, vectors=None, model_id=None, error=None,
+                      reader_id="legacy-v1"):
+        db.execute("""INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id,reader_id)
                 VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
                 size=excluded.size,modified=excluded.modified,status=excluded.status,
                 error=excluded.error,model_id=excluded.model_id,reader_id=excluded.reader_id""",
                 (root_id, str(path), path.name, path.suffix.lower(), stat.st_size, stat.st_mtime_ns,
                  "error" if error else "content" if passages else "metadata", error, model_id, reader_id))
-            file_id = db.execute("SELECT id FROM files WHERE path=?", (str(path),)).fetchone()[0]
-            db.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
-            db.executemany("INSERT INTO chunks(file_id,text,location,vector,model_id) VALUES (?,?,?,?,?)",
+        file_id = db.execute("SELECT id FROM files WHERE path=?", (str(path),)).fetchone()[0]
+        db.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+        db.executemany("INSERT INTO chunks(file_id,text,location,vector,model_id) VALUES (?,?,?,?,?)",
                            [(file_id, p.text, p.location, vectors[i] if vectors else None,
                              model_id if vectors else None) for i, p in enumerate(passages)])
 
-    def prune(self, root_id, seen):
-        with self.connect() as db:
+    def prune(self, root_id, seen, db=None):
+        if db is None:
+            with self.connect() as connection:
+                self.prune(root_id, seen, connection)
+            return
+        with db:
             missing = [(r["id"],) for r in db.execute("SELECT id,path FROM files WHERE root_id=?", (root_id,))
                        if r["path"] not in seen]
             db.executemany("DELETE FROM files WHERE id=?", missing)

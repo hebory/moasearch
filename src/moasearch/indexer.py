@@ -16,6 +16,11 @@ _CONTENT_READERS = {
     ".hwpx": "hwpx-v1",
 }
 
+_BATCH_FILES = 32
+_BATCH_CHUNKS = 256
+_BATCH_BYTES = 4 * 1024 * 1024
+_BATCH_SECONDS = 0.5
+
 
 def reader_id(path):
     suffix = path.suffix.lower()
@@ -121,109 +126,145 @@ class Indexer:
         try:
             settings = self.store.settings()
             model_id = self.engine.model_id() if self.engine else None
-            for root in self.store.roots():
-                if self._cancel.is_set():
-                    break
-                seen, failures = set(), []
-                base = Path(root["path"])
-                if not base.is_dir():
-                    self._error(f"폴더에 접근할 수 없습니다: {base}")
-                    continue
-                for path, stat in self._walk(base, failures):
-                    seen.add(str(path))
-                    state = self.status()
-                    self._update(scanned=state["scanned"] + 1, current_path=str(path),
-                                 current_page=0, total_pages=0)
-                    old = self.store.file_by_path(path)
-                    current_reader = reader_id(path)
-                    file_limit = settings["max_file_mb"] * 1024 * 1024
-                    indexed_reader = current_reader if stat.st_size <= file_limit else (
-                        f"size-limit-v1:{settings['max_file_mb']}:{current_reader}")
-                    # Older indexes did not distinguish an empty document from a
-                    # document skipped by the size limit. Read these once again.
-                    legacy_metadata = (old and old["status"] == "metadata"
-                                       and old["reader_id"] == "legacy-v1"
-                                       and stat.st_size <= file_limit and supports_content(path))
-                    if (old and old["modified"] == stat.st_mtime_ns and old["size"] == stat.st_size
-                            and old["status"] != "error"
-                            and not legacy_metadata
-                            and old["reader_id"] in (indexed_reader, f"empty-v1:{indexed_reader}")
-                            and (not model_id or old["model_id"] == model_id or old["status"] == "metadata")):
-                        self._update(skipped=self.status()["skipped"] + 1)
-                        continue
-                    passages, vectors, error = [], None, None
-                    try:
-                        if stat.st_size <= file_limit and supports_content(path):
-                            # Resolve immediately before read so a replaced parent cannot escape the root.
-                            resolved = path.resolve()
-                            if not within(resolved, base) or excluded(resolved):
-                                raise ValueError("색인 범위 밖으로 변경된 파일입니다.")
-                            suffix = path.suffix.lower()
-                            if suffix == ".pdf":
-                                def pdf_progress(page_number, total_pages, phase):
-                                    self._update(phase=phase, current_page=page_number,
-                                                 total_pages=total_pages)
-                                passages = chunk_passages(extract(
-                                    path, model_dir=self.store.data_dir / "models",
-                                    cancelled=self._cancel.is_set, progress=pdf_progress))
-                                self._update(phase="scanning", current_page=0, total_pages=0)
-                            elif suffix in IMAGE_SUFFIXES:
-                                self._update(phase="ocr")
-                                passages = chunk_passages(extract(path, model_dir=self.store.data_dir / "models"))
-                                self._update(phase="scanning", current_page=0, total_pages=0)
-                            else:
-                                passages = chunk_passages(extract(path))
-                            if not passages and current_reader == "legacy-v1":
-                                indexed_reader = f"empty-v1:{current_reader}"
-                        if passages and model_id and not self._cancel.is_set():
-                            try:
-                                self._update(phase="embedding")
-                                vectors = []
-                                for offset in range(0, len(passages), 4):
-                                    if self._cancel.is_set():
-                                        break
-                                    vectors.extend(self.engine.embed([p.text for p in passages[offset:offset + 4]]))
-                            except Exception as exc:
-                                self._error(f"의미 색인 실패, 본문은 저장합니다: {exc}")
-                                vectors = None
-                                model_id = None  # Avoid repeating a model failure for every file in this pass.
-                            finally:
-                                self._update(phase="scanning")
-                        after = path.stat()
-                        if (after.st_mtime_ns, after.st_size) != (stat.st_mtime_ns, stat.st_size):
-                            self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
-                            continue
-                    except Exception as exc:
-                        if isinstance(exc, InterruptedError) and self._cancel.is_set():
-                            self._update(phase="scanning", current_page=0, total_pages=0)
-                            break
-                        elif isinstance(exc, ExtractionError):
-                            passages = chunk_passages(exc.passages)
-                            vectors = None
-                            error = str(exc)[:500]
-                            self._error(f"{path.name}: {error}")
-                            try:
-                                after = path.stat()
-                            except OSError:
-                                self._error(f"읽는 중 사라져 다음 색인으로 미룹니다: {path}")
-                                continue
-                            if (after.st_mtime_ns, after.st_size) != (stat.st_mtime_ns, stat.st_size):
-                                self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
-                                continue
-                        else:
-                            error = str(exc)[:500]
-                            self._error(f"{path.name}: {error}")
-                        if path.suffix.lower() in IMAGE_SUFFIXES:
-                            self._update(phase="scanning", current_page=0, total_pages=0)
-                        elif path.suffix.lower() == ".pdf":
-                            self._update(phase="scanning", current_page=0, total_pages=0)
+            scanned = skipped = indexed = 0
+            with self.store.connect() as db:
+                for root in self.store.roots():
                     if self._cancel.is_set():
                         break
-                    self.store.replace_file(root["id"], path, stat, passages, vectors,
-                                            model_id if vectors else None, error, reader_id=indexed_reader)
-                    self._update(indexed=self.status()["indexed"] + 1)
-                if not failures and not self._cancel.is_set():
-                    self.store.prune(root["id"], seen)
+                    seen, failures = set(), []
+                    pending = []
+                    pending_chunks = pending_bytes = 0
+                    pending_since = None
+                    base = Path(root["path"])
+                    if not base.is_dir():
+                        self._error(f"폴더에 접근할 수 없습니다: {base}")
+                        continue
+
+                    def flush():
+                        nonlocal indexed, pending, pending_chunks, pending_bytes, pending_since
+                        if not pending:
+                            return
+                        records, count = pending, len(pending)
+                        pending = []
+                        pending_chunks = pending_bytes = 0
+                        pending_since = None
+                        self.store.replace_files(records, db=db)
+                        indexed += count
+                        self._update(indexed=indexed)
+
+                    try:
+                        for path, stat in self._walk(base, failures):
+                            seen.add(str(path))
+                            if pending_since is not None and time.monotonic() - pending_since >= _BATCH_SECONDS:
+                                flush()
+                            scanned += 1
+                            self._update(scanned=scanned, current_path=str(path),
+                                         current_page=0, total_pages=0)
+                            old = self.store.file_by_path(path, db=db)
+                            current_reader = reader_id(path)
+                            file_limit = settings["max_file_mb"] * 1024 * 1024
+                            indexed_reader = current_reader if stat.st_size <= file_limit else (
+                                f"size-limit-v1:{settings['max_file_mb']}:{current_reader}")
+                            # Older indexes did not distinguish an empty document from a
+                            # document skipped by the size limit. Read these once again.
+                            legacy_metadata = (old and old["status"] == "metadata"
+                                               and old["reader_id"] == "legacy-v1"
+                                               and stat.st_size <= file_limit and supports_content(path))
+                            if (old and old["modified"] == stat.st_mtime_ns and old["size"] == stat.st_size
+                                    and old["status"] != "error"
+                                    and not legacy_metadata
+                                    and old["reader_id"] in (indexed_reader, f"empty-v1:{indexed_reader}")
+                                    and (not model_id or old["model_id"] == model_id or old["status"] == "metadata")):
+                                skipped += 1
+                                self._update(skipped=skipped)
+                                continue
+                            passages, vectors, error = [], None, None
+                            try:
+                                if stat.st_size <= file_limit and supports_content(path):
+                                    # Resolve immediately before read so a replaced parent cannot escape the root.
+                                    resolved = path.resolve()
+                                    if not within(resolved, base) or excluded(resolved):
+                                        raise ValueError("색인 범위 밖으로 변경된 파일입니다.")
+                                    suffix = path.suffix.lower()
+                                    if suffix == ".pdf":
+                                        def pdf_progress(page_number, total_pages, phase):
+                                            self._update(phase=phase, current_page=page_number,
+                                                         total_pages=total_pages)
+                                        passages = chunk_passages(extract(
+                                            path, model_dir=self.store.data_dir / "models",
+                                            cancelled=self._cancel.is_set, progress=pdf_progress))
+                                        self._update(phase="scanning", current_page=0, total_pages=0)
+                                    elif suffix in IMAGE_SUFFIXES:
+                                        self._update(phase="ocr")
+                                        passages = chunk_passages(extract(path, model_dir=self.store.data_dir / "models"))
+                                        self._update(phase="scanning", current_page=0, total_pages=0)
+                                    else:
+                                        passages = chunk_passages(extract(path))
+                                    if not passages and current_reader == "legacy-v1":
+                                        indexed_reader = f"empty-v1:{current_reader}"
+                                if passages and model_id and not self._cancel.is_set():
+                                    try:
+                                        self._update(phase="embedding")
+                                        vectors = []
+                                        for offset in range(0, len(passages), 4):
+                                            if self._cancel.is_set():
+                                                break
+                                            vectors.extend(self.engine.embed([p.text for p in passages[offset:offset + 4]]))
+                                    except Exception as exc:
+                                        self._error(f"의미 색인 실패, 본문은 저장합니다: {exc}")
+                                        vectors = None
+                                        model_id = None  # Avoid repeating a model failure for every file in this pass.
+                                    finally:
+                                        self._update(phase="scanning")
+                                after = path.stat()
+                                if (after.st_mtime_ns, after.st_size) != (stat.st_mtime_ns, stat.st_size):
+                                    self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
+                                    continue
+                            except Exception as exc:
+                                if isinstance(exc, InterruptedError) and self._cancel.is_set():
+                                    self._update(phase="scanning", current_page=0, total_pages=0)
+                                    break
+                                elif isinstance(exc, ExtractionError):
+                                    passages = chunk_passages(exc.passages)
+                                    vectors = None
+                                    error = str(exc)[:500]
+                                    self._error(f"{path.name}: {error}")
+                                    try:
+                                        after = path.stat()
+                                    except OSError:
+                                        self._error(f"읽는 중 사라져 다음 색인으로 미룹니다: {path}")
+                                        continue
+                                    if (after.st_mtime_ns, after.st_size) != (stat.st_mtime_ns, stat.st_size):
+                                        self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
+                                        continue
+                                else:
+                                    error = str(exc)[:500]
+                                    self._error(f"{path.name}: {error}")
+                                if path.suffix.lower() in IMAGE_SUFFIXES or path.suffix.lower() == ".pdf":
+                                    self._update(phase="scanning", current_page=0, total_pages=0)
+                            if self._cancel.is_set():
+                                break
+
+                            record = dict(root_id=root["id"], path=path, stat=stat, passages=passages,
+                                          vectors=vectors, model_id=model_id if vectors else None,
+                                          error=error, reader_id=indexed_reader)
+                            pending.append(record)
+                            pending_chunks += len(passages)
+                            pending_bytes += sum(len(p.text.encode("utf-8")) + len(p.location.encode("utf-8"))
+                                                 for p in passages)
+                            pending_bytes += sum(len(vector) for vector in vectors or ())
+                            if pending_since is None:
+                                pending_since = time.monotonic()
+                            if (len(pending) >= _BATCH_FILES or pending_chunks >= _BATCH_CHUNKS
+                                    or pending_bytes >= _BATCH_BYTES
+                                    or time.monotonic() - pending_since >= _BATCH_SECONDS):
+                                flush()
+                    finally:
+                        # Commit completed files before pruning, including when
+                        # cancellation stops traversal. The current file is never queued.
+                        flush()
+                    if not failures and not self._cancel.is_set():
+                        self.store.prune(root["id"], seen, db=db)
         except Exception as exc:
             self._error(exc)
             self._update(phase="error")
