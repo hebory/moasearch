@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f7f4">
+  <meta name="moasearch-token" content="__TOKEN__">
+  <title>모아검색 · 내 파일 검색</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="검색 설정">
+      <a class="brand" href="#" aria-label="모아검색 홈">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 36 36" fill="none"><path d="M16.25 27.5a10.25 10.25 0 1 1 8.29-4.22l6.21 6.2" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><path d="M12 17.5h7M15.5 14v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <span class="brand-copy"><strong>모아검색</strong><small>내 파일을 위한 검색</small></span>
+      </a>
+
+      <div class="sidebar-heading"><span>검색 위치</span><button id="add-root" class="icon-button add-button" type="button" aria-label="검색 폴더 추가" title="검색 폴더 추가"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg></button></div>
+      <div id="root-list" class="root-list"><div class="loading-row">검색 위치를 불러오는 중…</div></div>
+      <p class="side-note">등록한 위치의 파일만 색인합니다.</p>
+
+      <div class="sidebar-spacer"></div>
+      <section id="engine-card" class="engine-card" aria-label="로컬 AI 상태">
+        <span class="engine-indicator" aria-hidden="true"></span>
+        <div class="engine-copy"><strong id="engine-title">로컬 AI 확인 중</strong><span id="engine-message">기기에서 직접 실행합니다</span></div>
+        <button id="open-settings" class="icon-button settings-button" type="button" aria-label="AI 설정 열기" title="AI 설정"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 2.8h4l.4 1.9 1.5.9 1.8-.6 2 3.4-1.4 1.3v1.8l1.4 1.3-2 3.4-1.8-.6-1.5.9-.4 1.9H8l-.4-1.9-1.5-.9-1.8.6-2-3.4 1.4-1.3v-1.8L4.3 8.4l2-3.4 1.8.6 1.5-.9L10 2.8Z"/><circle cx="10" cy="10.5" r="2.6"/></svg></button>
+      </section>
+      <footer class="sidebar-footer"><span class="privacy-dot" aria-hidden="true"></span>파일은 이 PC에만 보관돼요</footer>
+    </aside>
+
+    <main class="main-column">
+      <header class="topbar"><div class="breadcrumb"><span class="breadcrumb-dot"></span><span>개인 라이브러리</span></div><button id="rescan-top" class="text-button" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.6 7.5A7 7 0 0 0 4.7 5.3L3 7m0 0V3.8M3 7h3.2M3.4 12.5a7 7 0 0 0 11.9 2.2l1.7-1.7m0 0v3.2m0-3.2h-3.2"/></svg><span>다시 색인</span></button></header>
+      <div id="index-progress" class="progress-wrap" hidden><div class="progress-line"><span id="progress-label">색인 준비 중</span><button id="cancel-index" class="quiet-button" type="button">중지</button></div><div class="progress-track"><span></span></div><div id="progress-detail" class="progress-detail"></div></div>
+
+      <section class="search-hero" aria-labelledby="welcome-title">
+        <div class="eyebrow"><span class="eyebrow-dot"></span>당신의 모든 파일, 한 번에</div>
+        <h1 id="welcome-title">찾는 파일을 <span>말해 주세요.</span></h1>
+        <p class="hero-subtitle">파일 이름이 가물가물해도 괜찮아요.<br class="desktop-break"> 내용과 의미로 찾아드립니다.</p>
+        <form id="search-form" class="search-box" role="search">
+          <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.4 4.4"/></svg>
+          <input id="query" type="search" autocomplete="off" placeholder="예: 지난달 여행 영수증, 회의에서 정한 일정…" aria-label="찾을 파일을 자연어로 입력하세요">
+          <kbd>Enter</kbd>
+        </form>
+        <div class="search-meta"><span id="search-hint">한국어로 편하게 검색해 보세요</span><div class="mode-switch" role="group" aria-label="검색 방식"><button class="mode-button active" data-mode="hybrid" type="button" aria-pressed="true">의미 + 키워드</button><button class="mode-button" data-mode="keyword" type="button" aria-pressed="false">키워드만</button></div></div>
+      </section>
+
+      <section id="welcome" class="welcome-panel" aria-label="시작하기">
+        <div class="welcome-art" aria-hidden="true"><span class="art-spark spark-one">✳</span><span class="art-spark spark-two">✳</span><div class="paper paper-back"></div><div class="paper paper-mid"></div><div class="paper paper-front"><span></span><span></span><span></span><i></i></div><div class="art-lens"></div></div>
+        <div class="welcome-copy"><span class="welcome-kicker">먼저 검색 공간을 만들어요</span><h2>파일이 있는 폴더를 추가해 주세요.</h2><p>문서와 PDF 내용을 읽어 로컬 색인을 만들어요.<br>원본 파일은 이동하거나 변경하지 않습니다.</p><button id="add-folder-welcome" class="primary-button" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6.5h5l1.5 1.8H17v7.2H3zM3 6.5V5h6l1.5 1.5"/></svg>폴더 추가</button><span class="welcome-footnote">폴더를 등록하기 전에는 아무 파일도 읽지 않아요.</span></div>
+      </section>
+
+      <section id="library-idle" class="library-idle" hidden aria-label="검색 준비 상태"><span class="idle-mark" aria-hidden="true">✳</span><div class="idle-copy"><strong id="idle-title">검색 위치를 연결했어요</strong><span id="idle-message">색인을 시작하면 파일 이름과 문서 내용을 검색할 수 있어요.</span></div><button id="start-index-empty" class="secondary-button" type="button">색인 시작</button></section>
+
+      <section id="results-view" class="results-view" hidden>
+        <div class="results-heading"><div><div class="section-overline">검색 결과</div><h2 id="results-title">결과</h2></div><div class="result-tools"><button id="answer-request" class="ask-button" type="button" aria-label="찾은 파일 내용을 AI에 질문"><span aria-hidden="true">✳</span> 내 파일에 질문</button><label class="filter-select"><span class="sr-only">파일 종류 필터</span><select id="extension-filter"><option value="">모든 종류</option><option value="pdf">PDF</option><option value="docx">Word</option><option value="xlsx">Excel</option><option value="pptx">PowerPoint</option><option value="hwp">HWP</option><option value="hwpx">HWPX</option><option value="png">PNG 이미지</option><option value="jpg">JPG 이미지</option><option value="jpeg">JPEG 이미지</option><option value="tif">TIF 이미지</option><option value="tiff">TIFF 이미지</option><option value="bmp">BMP 이미지</option><option value="webp">WebP 이미지</option><option value="txt">텍스트</option><option value="md">Markdown</option><option value="py">Python</option></select><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></label></div></div>
+        <div id="result-layout" class="result-layout">
+          <div id="results-list" class="results-list" role="list" aria-label="검색 결과"></div>
+          <aside id="preview" class="preview-panel" aria-label="파일 미리보기"><div class="preview-empty"><span class="preview-empty-icon"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M8 4.5h10l7 7v16H8z"/><path d="M18 4.5v7h7M12 17h9M12 21h9"/></svg></span><strong>파일을 선택해 주세요</strong><span>내용과 위치를 여기서 확인할 수 있어요.</span></div></aside>
+        </div>
+      </section>
+
+      <section id="answer-view" class="answer-view" hidden aria-live="polite"><div class="answer-heading"><span class="answer-spark">✳</span><span>내 파일에서 찾은 답변</span><span id="answer-state" class="answer-state">로컬 AI</span></div><div id="answer-text" class="answer-text"></div><div id="answer-sources" class="answer-sources"></div></section>
+      <footer class="main-footer"><span id="library-summary">라이브러리를 연결해 시작하세요</span><span class="footer-right"><span class="footer-lock">⌑</span> 모든 AI 처리는 내 PC에서만</span></footer>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title"><form method="dialog" class="dialog-close-wrap"><button class="icon-button dialog-x" aria-label="닫기" value="close">×</button></form><div class="settings-content"><div class="dialog-eyebrow">내 PC 안의 AI</div><h2 id="settings-title">로컬 AI 설정</h2><p class="dialog-intro">Google 모델을 이 PC 안에서 실행합니다. 모델을 받은 뒤에는 인터넷 없이 검색하고 답변을 만들 수 있어요.</p><form id="settings-form" class="settings-form"><label class="field-label">임베딩 모델 경로<span>Google EmbeddingGemma 2로 의미를 검색해요</span><input name="embedding_model" type="text" placeholder="예: C:\\Users\\me\\Models\\embedding.gguf"></label><label class="field-label">답변 모델 경로<span>Google Gemma 4 E2B로 문서에 답해요</span><input name="chat_model" type="text" placeholder="예: C:\\Users\\me\\Models\\chat.gguf"></label><div class="settings-grid"><label class="field-label">GPU 오프로딩 층<span>현재 배포 빌드는 CPU를 사용해요</span><input name="n_gpu_layers" type="number" min="-1" max="200" value="0"></label><label class="field-label">컨텍스트 크기<input name="context_size" type="number" min="512" max="32768" step="512" value="4096"></label><label class="field-label">파일 한도 (MB)<input name="max_file_mb" type="number" min="1" max="512" value="32"></label><label class="field-label">자동 색인 간격 (초)<input name="scan_interval" type="number" min="0" max="86400" value="300"></label></div><div class="model-note"><span class="model-note-icon">✳</span><span>의미 검색 모델은 약 310 MB, 답변 모델은 약 3.35 GB입니다. 한국어·영어 OCR 전용 모델은 약 18 MB입니다. Google 모델의 고정 버전과 체크섬을 확인하며, 이전 모델의 색인은 다시 생성해야 합니다.</span></div><div class="dialog-actions"><button type="button" id="download-embedding" class="secondary-button">임베딩 모델 받기</button><button type="button" id="download-chat" class="secondary-button">답변 모델 받기</button><button type="button" id="download-ocr" class="secondary-button">이미지·PDF OCR 모델 받기</button><button type="submit" class="primary-button">설정 저장</button></div><div id="ocr-status" class="supported-copy" aria-live="polite">이미지·PDF OCR 상태를 확인하고 있어요.</div><div id="download-progress" class="download-progress" hidden><div class="download-progress-track"><span id="download-progress-fill"></span></div><span id="download-progress-text" aria-live="polite"></span></div><p id="settings-feedback" class="form-feedback" aria-live="polite"></p></form><div class="dialog-divider"></div><div class="supported-title">파일에서 읽는 내용</div><p class="supported-copy">텍스트, 코드, 텍스트 레이어가 있는 PDF와 스캔 PDF, Word·Excel·PowerPoint, HWP5·HWPX 본문과 PNG·JPEG·BMP·TIFF·WebP 이미지의 한국어·영어 OCR을 색인해요. PDF는 텍스트를 먼저 읽고 필요한 페이지만 OCR합니다.</p><p class="supported-copy muted">등록한 폴더만 읽고, 파일 내용은 이 PC의 내장 모델에서만 처리됩니다.</p></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

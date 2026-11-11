@@ -1,0 +1,44 @@
+[package]
+name = "moasearch"
+version = "0.2.0"
+edition = "2024"
+description = "Rust와 Google 로컬 모델로 동작하는 개인 파일 검색"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+cfb = "0.14"
+clap = { version = "4", features = ["derive", "env"] }
+ctrlc = "3.4"
+encoding_rs = "0.8"
+flate2 = "1.1"
+image = "0.25"
+tiff = "0.11"
+unicode-normalization = "0.1"
+lopdf = "0.38"
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "955aa2f72463c2535cc5ab894d5d52f27a38cde2", default-features = false }
+quick-xml = "0.42"
+oar-ocr = { version = "=0.10.2", default-features = false, features = ["download-binaries", "simd"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std"] }
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+zip = { version = "6", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
