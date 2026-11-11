@@ -22,7 +22,7 @@ class Store:
                     id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
                     path TEXT UNIQUE NOT NULL, name TEXT NOT NULL, extension TEXT NOT NULL,
                     size INTEGER NOT NULL, modified INTEGER NOT NULL, status TEXT NOT NULL,
-                    error TEXT, model_id TEXT);
+                    error TEXT, model_id TEXT, reader_id TEXT NOT NULL DEFAULT 'legacy-v1');
                 CREATE INDEX IF NOT EXISTS files_root ON files(root_id);
                 CREATE TABLE IF NOT EXISTS chunks (
                     id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -37,6 +37,12 @@ class Store:
                     INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text);
                 END;
             """)
+            # Existing user indexes stay intact and acquire a version for the
+            # reader that produced their current text. New readers can then
+            # selectively refresh only formats whose extraction changed.
+            file_columns = {row["name"] for row in db.execute("PRAGMA table_info(files)")}
+            if "reader_id" not in file_columns:
+                db.execute("ALTER TABLE files ADD COLUMN reader_id TEXT NOT NULL DEFAULT 'legacy-v1'")
 
     @contextmanager
     def connect(self):
@@ -113,14 +119,15 @@ class Store:
             return dict(row) | {"passages": [dict(r) for r in db.execute(
                 "SELECT text,location FROM chunks WHERE file_id=? ORDER BY id LIMIT 100", (file_id,))]}
 
-    def replace_file(self, root_id, path, stat, passages, vectors=None, model_id=None, error=None):
+    def replace_file(self, root_id, path, stat, passages, vectors=None, model_id=None, error=None,
+                     reader_id="legacy-v1"):
         with self.connect() as db:
-            db.execute("""INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id)
-                VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+            db.execute("""INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id,reader_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
                 size=excluded.size,modified=excluded.modified,status=excluded.status,
-                error=excluded.error,model_id=excluded.model_id""",
+                error=excluded.error,model_id=excluded.model_id,reader_id=excluded.reader_id""",
                 (root_id, str(path), path.name, path.suffix.lower(), stat.st_size, stat.st_mtime_ns,
-                 "error" if error else "content" if passages else "metadata", error, model_id))
+                 "error" if error else "content" if passages else "metadata", error, model_id, reader_id))
             file_id = db.execute("SELECT id FROM files WHERE path=?", (str(path),)).fetchone()[0]
             db.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
             db.executemany("INSERT INTO chunks(file_id,text,location,vector,model_id) VALUES (?,?,?,?,?)",

@@ -8,6 +8,19 @@ from contextlib import contextmanager
 
 from .config import excluded, within
 from .extractors import extract, chunk_passages, supports_content
+from .ocr import IMAGE_SUFFIXES
+
+_CONTENT_READERS = {
+    ".hwp": "hwp-v1",
+    ".hwpx": "hwpx-v1",
+}
+
+
+def reader_id(path):
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return "ocr-ppocrv5-ko-v1"
+    return _CONTENT_READERS.get(suffix, "legacy-v1")
 
 
 class Indexer:
@@ -118,21 +131,37 @@ class Indexer:
                     state = self.status()
                     self._update(scanned=state["scanned"] + 1, current_path=str(path))
                     old = self.store.file_by_path(path)
+                    current_reader = reader_id(path)
+                    file_limit = settings["max_file_mb"] * 1024 * 1024
+                    indexed_reader = current_reader if stat.st_size <= file_limit else (
+                        f"size-limit-v1:{settings['max_file_mb']}:{current_reader}")
+                    # Older indexes did not distinguish an empty document from a
+                    # document skipped by the size limit. Read these once again.
+                    legacy_metadata = (old and old["status"] == "metadata"
+                                       and old["reader_id"] == "legacy-v1"
+                                       and stat.st_size <= file_limit and supports_content(path))
                     if (old and old["modified"] == stat.st_mtime_ns and old["size"] == stat.st_size
                             and old["status"] != "error"
-                            and not (old["status"] == "metadata" and supports_content(path)
-                                     and stat.st_size <= settings["max_file_mb"] * 1024 * 1024)
+                            and not legacy_metadata
+                            and old["reader_id"] in (indexed_reader, f"empty-v1:{indexed_reader}")
                             and (not model_id or old["model_id"] == model_id or old["status"] == "metadata")):
                         self._update(skipped=self.status()["skipped"] + 1)
                         continue
                     passages, vectors, error = [], None, None
                     try:
-                        if stat.st_size <= settings["max_file_mb"] * 1024 * 1024 and supports_content(path):
+                        if stat.st_size <= file_limit and supports_content(path):
                             # Resolve immediately before read so a replaced parent cannot escape the root.
                             resolved = path.resolve()
                             if not within(resolved, base) or excluded(resolved):
                                 raise ValueError("색인 범위 밖으로 변경된 파일입니다.")
-                            passages = chunk_passages(extract(path))
+                            if path.suffix.lower() in IMAGE_SUFFIXES:
+                                self._update(phase="ocr")
+                                passages = chunk_passages(extract(path, model_dir=self.store.data_dir / "models"))
+                                self._update(phase="scanning")
+                            else:
+                                passages = chunk_passages(extract(path))
+                            if not passages and current_reader == "legacy-v1":
+                                indexed_reader = f"empty-v1:{current_reader}"
                         if passages and model_id and not self._cancel.is_set():
                             try:
                                 self._update(phase="embedding")
@@ -154,10 +183,12 @@ class Indexer:
                     except Exception as exc:
                         error = str(exc)[:500]
                         self._error(f"{path.name}: {error}")
+                        if path.suffix.lower() in IMAGE_SUFFIXES:
+                            self._update(phase="scanning")
                     if self._cancel.is_set():
                         break
                     self.store.replace_file(root["id"], path, stat, passages, vectors,
-                                            model_id if vectors else None, error)
+                                            model_id if vectors else None, error, reader_id=indexed_reader)
                     self._update(indexed=self.status()["indexed"] + 1)
                 if not failures and not self._cancel.is_set():
                     self.store.prune(root["id"], seen)

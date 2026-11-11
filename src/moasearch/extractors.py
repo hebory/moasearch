@@ -28,6 +28,7 @@ _TEXT_SUFFIXES = {
     ".gradle", ".properties", ".tex", ".bib", ".srt", ".vtt",
 }
 _ARCHIVE_SUFFIXES = {".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 _MAX_ARCHIVE_ENTRIES = 30_000
 _MAX_ENTRY_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -38,7 +39,8 @@ _MAX_PDF_PAGES = 250
 def supports_content(path: Path) -> bool:
     """Return whether the filename has a supported text/document format."""
     suffix = path.suffix.lower()
-    return suffix in _TEXT_SUFFIXES or suffix == ".pdf" or suffix in _ARCHIVE_SUFFIXES
+    return (suffix in _TEXT_SUFFIXES or suffix == ".pdf" or suffix in _ARCHIVE_SUFFIXES
+            or suffix in {".hwp", ".hwpx"} or suffix in IMAGE_SUFFIXES)
 
 
 def _decode(data: bytes) -> str:
@@ -229,7 +231,7 @@ def _pdf(path: Path, max_chars: int) -> list[Passage]:
     return passages
 
 
-def extract(path: Path, max_chars: int = 200_000) -> list[Passage]:
+def extract(path: Path, max_chars: int = 200_000, *, model_dir: Path | None = None) -> list[Passage]:
     """Extract bounded, location-labelled text from a supported local file.
 
     Unsupported files (including unknown binary files) return an empty list.
@@ -239,6 +241,15 @@ def extract(path: Path, max_chars: int = 200_000) -> list[Passage]:
         raise ValueError("max_chars must be positive")
     path = Path(path)
     suffix = path.suffix.lower()
+    if suffix in {".hwp", ".hwpx"}:
+        from .hangul import extract_hwp, extract_hwpx
+        reader = extract_hwp if suffix == ".hwp" else extract_hwpx
+        return [Passage(text, location) for text, location in reader(path, max_chars)]
+    if suffix in IMAGE_SUFFIXES:
+        from .config import data_directory
+        from .ocr import extract_image
+        directory = Path(model_dir) if model_dir is not None else data_directory() / "models"
+        return [Passage(text, location) for text, location in extract_image(path, max_chars, directory)]
     if suffix == ".pdf":
         return _pdf(path, max_chars)
     if suffix in _ARCHIVE_SUFFIXES:

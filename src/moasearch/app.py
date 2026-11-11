@@ -20,6 +20,7 @@ from .engine import EmbeddedEngine
 from .indexer import Indexer
 from .search import Search
 from .store import Store
+from .ocr import status as ocr_status
 
 
 class RootInput(BaseModel):
@@ -27,7 +28,7 @@ class RootInput(BaseModel):
 
 
 class DownloadInput(BaseModel):
-    kind: str = Field(pattern="^(embedding|chat)$")
+    kind: str = Field(pattern="^(embedding|chat|ocr)$")
 
 
 class SearchInput(BaseModel):
@@ -107,6 +108,7 @@ def create_app(data_dir=None, engine=None):
     def status():
         return {"counts": store.counts(), "roots": store.roots(), "index": indexer.status(),
                 "settings": store.settings(), "engine": engine.status(), "suggestions": suggestions(),
+                "ocr": ocr_status(store.data_dir / "models"),
                 "model_download": download_state.copy()}
 
     @app.post("/api/models/download")
@@ -124,15 +126,17 @@ def create_app(data_dir=None, engine=None):
                 while True:
                     try:
                         with indexer.idle_changes():
-                            store.update_settings({f"{body.kind}_model": str(model_path)})
-                            engine.reset()
+                            if body.kind != "ocr":
+                                store.update_settings({f"{body.kind}_model": str(model_path)})
+                                engine.reset()
                         break
                     except ValueError:
                         if not indexer.status()["running"]:
                             raise
                         download_state["message"] = "다운로드 완료. 현재 색인이 끝나면 모델을 적용합니다."
                         time.sleep(.5)
-                download_state["message"] = "모델 준비 완료. 다시 색인하면 의미 검색을 사용할 수 있습니다."
+                download_state["message"] = ("OCR 모델 준비 완료. 다시 색인하면 이미지의 글자를 검색할 수 있습니다."
+                                             if body.kind == "ocr" else "모델 준비 완료. 다시 색인하면 의미 검색을 사용할 수 있습니다.")
             except Exception as exc:
                 download_state.update(error=str(exc)[:500], message="모델 다운로드 실패")
             finally:
@@ -213,9 +217,9 @@ def create_app(data_dir=None, engine=None):
     @app.post("/api/files/{file_id}/open")
     def open_file(file_id: int):
         path = action_path(file_id)
-        safe_documents = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+        safe_documents = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".hwp", ".hwpx",
                           ".txt", ".md", ".csv", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-                          ".mp3", ".wav", ".mp4", ".mkv"}
+                          ".mp3", ".wav", ".mp4", ".mkv", ".bmp", ".tif", ".tiff"}
         if path.suffix.lower() not in safe_documents:
             raise HTTPException(400, "이 형식은 폴더에서 확인하세요. 실행 파일과 스크립트는 앱에서 실행하지 않습니다.")
         if os.name == "nt":

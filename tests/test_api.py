@@ -131,6 +131,21 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(state["model_download"]["error"])
         self.assertEqual(state["settings"]["chat_model"], "")
 
+    def test_ocr_download_keeps_language_model_settings_and_exposes_status(self) -> None:
+        original = self.app.state.store.settings()
+        state = {"available": True, "ready": True, "message": "OCR 모델 준비"}
+        with patch("moasearch.models.download_model", return_value=self.data / "models") as download, \
+             patch("moasearch.app.ocr_status", return_value=state):
+            response = self.client.post("/api/models/download", headers=self.headers, json={"kind": "ocr"})
+            self.assertEqual(response.status_code, 200)
+            result = self.wait_download()
+        self.assertEqual(download.call_args.args[:2], ("ocr", self.data / "models"))
+        self.assertEqual(result["model_download"]["error"], "")
+        self.assertIn("다시 색인", result["model_download"]["message"])
+        self.assertEqual(result["settings"], original)
+        self.assertEqual(self.engine.resets, 0)
+        self.assertEqual(result["ocr"], state)
+
     def wait_download(self):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
