@@ -1,22 +1,18 @@
-param([switch]$SkipModels)
+﻿param([switch]$SkipModels, [string]$DataDir = '')
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
-$env:UV_CACHE_DIR = Join-Path $PSScriptRoot '.moasearch-cache'
-$env:PYTHONUTF8 = '1'
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    throw 'Install uv from https://docs.astral.sh/uv/getting-started/installation/ first.'
-}
-uv sync --extra ai --locked
-if ($LASTEXITCODE -ne 0) { throw 'Embedded engine installation failed.' }
-$pythonExe = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+$appExe = Join-Path $PSScriptRoot 'dist\moasearch.exe'
+if (-not (Test-Path -LiteralPath $appExe)) { & (Join-Path $PSScriptRoot 'build.ps1') }
+$baseArgs = @()
+if ($DataDir) { $baseArgs += @('--data-dir', $DataDir) }
 if (-not $SkipModels) {
-    & $pythonExe -m moasearch models download embedding
-    if ($LASTEXITCODE -ne 0) { throw 'Embedding model download failed.' }
-    & $pythonExe -m moasearch models download chat
-    if ($LASTEXITCODE -ne 0) { throw 'Chat model download failed.' }
-    & $pythonExe -m moasearch models download ocr
-    if ($LASTEXITCODE -ne 0) { throw 'OCR model download failed.' }
+    & $appExe @baseArgs models download embedding
+    if ($LASTEXITCODE -ne 0) { throw 'EmbeddingGemma 모델 준비에 실패했습니다.' }
+    & $appExe @baseArgs models download chat
+    if ($LASTEXITCODE -ne 0) { throw 'Gemma 답변 모델 준비에 실패했습니다.' }
+    & $appExe @baseArgs models download ocr
+    if ($LASTEXITCODE -ne 0) { throw 'OCR 모델 준비에 실패했습니다.' }
 }
-& $pythonExe -m moasearch doctor
+& $appExe @baseArgs doctor
 exit $LASTEXITCODE
 
