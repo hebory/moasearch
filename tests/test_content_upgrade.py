@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from moasearch.extractors import Passage
-from moasearch.indexer import Indexer
+from moasearch.extractors import ExtractionError, Passage
+from moasearch.indexer import Indexer, reader_id
 from moasearch.search import Search
 from moasearch.store import Store
 
@@ -179,6 +179,101 @@ class ContentUpgradeTests(unittest.TestCase):
             self.scan()
         self.assertEqual(read.call_count, 1)
         self.assertEqual(self.store.file_by_path(path)["reader_id"], "empty-v1:legacy-v1")
+
+    def test_pdf_reader_upgrade_reindexes_old_content_and_metadata(self):
+        cases = [
+            ("searchable.pdf", "content", [Passage("이전 PDF 내용", "1페이지")]),
+            ("scanned.pdf", "metadata", []),
+        ]
+        paths = []
+        for name, status, passages in cases:
+            path = self.library / name
+            path.write_bytes(b"pdf")
+            paths.append(path)
+            self.store.replace_file(self.root_id, path, path.stat(), passages, reader_id="legacy-v1")
+            if status == "metadata":
+                # Metadata may be from a legacy scan that did not extract PDF text.
+                with self.store.connect() as db:
+                    db.execute("DELETE FROM chunks WHERE file_id=?",
+                               (self.store.file_by_path(path)["id"],))
+                    db.execute("UPDATE files SET status='metadata' WHERE path=?", (str(path),))
+
+        text_by_path = {
+            str(paths[0]): [Passage("계약서 PDF 본문", "1페이지")],
+            str(paths[1]): [Passage("스캔 PDF 예약 번호 PDF-7319", "2페이지 OCR")],
+        }
+        observed = []
+        def new_reader(path, **kwargs):
+            self.assertIn("model_dir", kwargs)
+            self.assertTrue(callable(kwargs["cancelled"]))
+            self.assertTrue(callable(kwargs["progress"]))
+            kwargs["progress"](2, 3, "pdf_ocr")
+            observed.append(self.indexer.status().copy())
+            return text_by_path[str(path)]
+        with patch("moasearch.indexer.extract", side_effect=new_reader) as read:
+            status = self.scan()
+        self.assertEqual(status["indexed"], 2)
+        self.assertEqual(read.call_count, 2)
+        self.assertTrue(all(self.store.file_by_path(path)["reader_id"] == "pdf-ocr-v1" for path in paths))
+        self.assertEqual(observed[-1]["phase"], "pdf_ocr")
+        self.assertEqual(observed[-1]["current_page"], 2)
+        self.assertEqual(observed[-1]["total_pages"], 3)
+        self.assertEqual(status["current_page"], 0)
+        self.assertEqual(status["total_pages"], 0)
+        found = Search(self.store).search("PDF-7319", mode="keyword")["results"]
+        self.assertEqual(found[0]["name"], "scanned.pdf")
+        self.assertEqual(self.scan()["skipped"], 2)
+
+    def test_pdf_partial_passages_are_searchable_and_missing_ocr_retries(self):
+        pdf = self.library / "mixed.pdf"
+        pdf.write_bytes(b"pdf")
+        self.store.replace_file(self.root_id, pdf, pdf.stat(),
+                                [Passage("기존 텍스트층 유지 내용", "1페이지")], reader_id="legacy-v1")
+        partial = [Passage("2페이지 스캔에서 읽힌 주문번호 RCT-5082", "2페이지 OCR")]
+        with patch("moasearch.indexer.extract", side_effect=ExtractionError("OCR 모델이 없습니다.", partial)):
+            first = self.scan()
+        row = self.store.file_by_path(pdf)
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["reader_id"], "pdf-ocr-v1")
+        indexed = self.store.file(row["id"])
+        texts = [passage["text"] for passage in indexed["passages"]]
+        self.assertEqual(texts, ["2페이지 스캔에서 읽힌 주문번호 RCT-5082"])
+        self.assertEqual(Search(self.store).search("RCT-5082", mode="keyword")["results"][0]["name"], "mixed.pdf")
+
+        with patch("moasearch.indexer.extract", return_value=[
+            Passage("1페이지 기존 텍스트층 유지 내용", "1페이지"), *partial,
+        ]) as read:
+            second = self.scan()
+        self.assertEqual(second["errors"], 0)
+        self.assertEqual(read.call_count, 1)
+        refreshed = self.store.file_by_path(pdf)
+        self.assertEqual(refreshed["status"], "content")
+        self.assertEqual(len(self.store.file(refreshed["id"])["passages"]), 2)
+
+    def test_pdf_progress_state_resets_when_cancelled_and_does_not_commit_partial_text(self):
+        pdf = self.library / "long.pdf"
+        pdf.write_bytes(b"pdf")
+        old = [Passage("기존 PDF 색인", "1페이지")]
+        self.store.replace_file(self.root_id, pdf, pdf.stat(), old, reader_id="legacy-v1")
+
+        def partial_then_cancel(path, **kwargs):
+            kwargs["progress"](4, 9, "pdf_ocr")
+            self.assertEqual(self.indexer.status()["current_page"], 4)
+            self.assertEqual(self.indexer.status()["total_pages"], 9)
+            self.indexer.cancel()
+            raise InterruptedError("사용자가 PDF 색인을 취소했습니다.")
+
+        with patch("moasearch.indexer.extract", side_effect=partial_then_cancel):
+            status = self.scan()
+        self.assertEqual(status["phase"], "cancelled")
+        self.assertEqual(status["errors"], 0)
+        self.assertEqual(status["current_page"], 0)
+        self.assertEqual(status["total_pages"], 0)
+        row = self.store.file_by_path(pdf)
+        self.assertEqual(row["reader_id"], "legacy-v1")
+        indexed = self.store.file(row["id"])
+        self.assertEqual([p["text"] for p in indexed["passages"]], ["기존 PDF 색인"])
 
 
 if __name__ == "__main__":

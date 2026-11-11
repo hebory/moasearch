@@ -135,7 +135,7 @@ def create_app(data_dir=None, engine=None):
                             raise
                         download_state["message"] = "다운로드 완료. 현재 색인이 끝나면 모델을 적용합니다."
                         time.sleep(.5)
-                download_state["message"] = ("OCR 모델 준비 완료. 다시 색인하면 이미지의 글자를 검색할 수 있습니다."
+                download_state["message"] = ("OCR 모델 준비 완료. 다시 색인하면 이미지와 스캔 PDF의 글자를 검색할 수 있습니다."
                                              if body.kind == "ocr" else "모델 준비 완료. 다시 색인하면 의미 검색을 사용할 수 있습니다.")
             except Exception as exc:
                 download_state.update(error=str(exc)[:500], message="모델 다운로드 실패")

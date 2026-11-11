@@ -32,7 +32,7 @@ def main(argv=None):
     models = commands.add_parser("models", help="내장 모델 관리")
     model_cmd = models.add_subparsers(dest="model_command", required=True)
     model_cmd.add_parser("list", help="기본 모델 목록")
-    download = model_cmd.add_parser("download", help="내장 GGUF 또는 이미지 OCR 모델 다운로드 및 설정")
+    download = model_cmd.add_parser("download", help="내장 GGUF 또는 이미지·PDF OCR 모델 다운로드 및 설정")
     download.add_argument("kind", choices=["embedding", "chat", "ocr"])
     args = parser.parse_args(argv)
     try:

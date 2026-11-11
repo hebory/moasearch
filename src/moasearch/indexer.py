@@ -7,10 +7,11 @@ import time
 from contextlib import contextmanager
 
 from .config import excluded, within
-from .extractors import extract, chunk_passages, supports_content
+from .extractors import ExtractionError, extract, chunk_passages, supports_content
 from .ocr import IMAGE_SUFFIXES
 
 _CONTENT_READERS = {
+    ".pdf": "pdf-ocr-v1",
     ".hwp": "hwp-v1",
     ".hwpx": "hwpx-v1",
 }
@@ -32,7 +33,8 @@ class Indexer:
         self._thread = None
         self._scheduler = None
         self._state = dict(running=False, scanned=0, indexed=0, skipped=0, errors=0,
-                           current_path="", last_error="", phase="idle")
+                           current_path="", current_page=0, total_pages=0,
+                           last_error="", phase="idle")
 
     def status(self):
         with self._guard:
@@ -48,7 +50,8 @@ class Indexer:
                 return False
             self._cancel.clear()
             self._state.update(running=True, scanned=0, indexed=0, skipped=0, errors=0,
-                               current_path="", last_error="", phase="scanning")
+                               current_path="", current_page=0, total_pages=0,
+                               last_error="", phase="scanning")
             self._thread = threading.Thread(target=self._run, name="moasearch-index", daemon=True)
             self._thread.start()
             return True
@@ -129,7 +132,8 @@ class Indexer:
                 for path, stat in self._walk(base, failures):
                     seen.add(str(path))
                     state = self.status()
-                    self._update(scanned=state["scanned"] + 1, current_path=str(path))
+                    self._update(scanned=state["scanned"] + 1, current_path=str(path),
+                                 current_page=0, total_pages=0)
                     old = self.store.file_by_path(path)
                     current_reader = reader_id(path)
                     file_limit = settings["max_file_mb"] * 1024 * 1024
@@ -154,10 +158,19 @@ class Indexer:
                             resolved = path.resolve()
                             if not within(resolved, base) or excluded(resolved):
                                 raise ValueError("색인 범위 밖으로 변경된 파일입니다.")
-                            if path.suffix.lower() in IMAGE_SUFFIXES:
+                            suffix = path.suffix.lower()
+                            if suffix == ".pdf":
+                                def pdf_progress(page_number, total_pages, phase):
+                                    self._update(phase=phase, current_page=page_number,
+                                                 total_pages=total_pages)
+                                passages = chunk_passages(extract(
+                                    path, model_dir=self.store.data_dir / "models",
+                                    cancelled=self._cancel.is_set, progress=pdf_progress))
+                                self._update(phase="scanning", current_page=0, total_pages=0)
+                            elif suffix in IMAGE_SUFFIXES:
                                 self._update(phase="ocr")
                                 passages = chunk_passages(extract(path, model_dir=self.store.data_dir / "models"))
-                                self._update(phase="scanning")
+                                self._update(phase="scanning", current_page=0, total_pages=0)
                             else:
                                 passages = chunk_passages(extract(path))
                             if not passages and current_reader == "legacy-v1":
@@ -181,10 +194,29 @@ class Indexer:
                             self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
                             continue
                     except Exception as exc:
-                        error = str(exc)[:500]
-                        self._error(f"{path.name}: {error}")
+                        if isinstance(exc, InterruptedError) and self._cancel.is_set():
+                            self._update(phase="scanning", current_page=0, total_pages=0)
+                            break
+                        elif isinstance(exc, ExtractionError):
+                            passages = chunk_passages(exc.passages)
+                            vectors = None
+                            error = str(exc)[:500]
+                            self._error(f"{path.name}: {error}")
+                            try:
+                                after = path.stat()
+                            except OSError:
+                                self._error(f"읽는 중 사라져 다음 색인으로 미룹니다: {path}")
+                                continue
+                            if (after.st_mtime_ns, after.st_size) != (stat.st_mtime_ns, stat.st_size):
+                                self._error(f"읽는 중 변경되어 다음 색인으로 미룹니다: {path}")
+                                continue
+                        else:
+                            error = str(exc)[:500]
+                            self._error(f"{path.name}: {error}")
                         if path.suffix.lower() in IMAGE_SUFFIXES:
-                            self._update(phase="scanning")
+                            self._update(phase="scanning", current_page=0, total_pages=0)
+                        elif path.suffix.lower() == ".pdf":
+                            self._update(phase="scanning", current_page=0, total_pages=0)
                     if self._cancel.is_set():
                         break
                     self.store.replace_file(root["id"], path, stat, passages, vectors,
@@ -197,5 +229,5 @@ class Indexer:
             self._update(phase="error")
         finally:
             phase = "cancelled" if self._cancel.is_set() else "error" if self.status()["phase"] == "error" else "complete"
-            self._update(running=False, current_path="", phase=phase)
+            self._update(running=False, current_path="", current_page=0, total_pages=0, phase=phase)
 
