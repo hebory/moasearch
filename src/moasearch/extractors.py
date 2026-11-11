@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html.parser import HTMLParser
-import io
 from pathlib import Path
 import re
 import zipfile
@@ -15,6 +14,14 @@ from xml.etree import ElementTree
 class Passage:
     text: str
     location: str
+
+
+class ExtractionError(ValueError):
+    """A partially readable document; retain its successfully extracted text."""
+
+    def __init__(self, message, passages):
+        super().__init__(message)
+        self.passages = passages
 
 
 _TEXT_SUFFIXES = {
@@ -32,8 +39,6 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 _MAX_ARCHIVE_ENTRIES = 30_000
 _MAX_ENTRY_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
-_MAX_PDF_BYTES = 100 * 1024 * 1024
-_MAX_PDF_PAGES = 250
 
 
 def supports_content(path: Path) -> bool:
@@ -209,29 +214,8 @@ def _ooxml(path: Path, max_chars: int) -> list[Passage]:
     return passages
 
 
-def _pdf(path: Path, max_chars: int) -> list[Passage]:
-    if path.stat().st_size > _MAX_PDF_BYTES:
-        raise ValueError("PDF 파일이 허용 크기(100 MiB)를 넘었습니다.")
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("PDF 읽기에는 pypdf 패키지가 필요합니다.") from exc
-    raw = path.read_bytes()
-    reader = PdfReader(io.BytesIO(raw), strict=False)
-    passages: list[Passage] = []
-    consumed = 0
-    for i, page in enumerate(reader.pages[:_MAX_PDF_PAGES], 1):
-        text = (page.extract_text() or "").strip()
-        text = text[:max_chars - consumed].strip()
-        if text:
-            passages.append(Passage(text, f"{i}페이지"))
-            consumed += len(text)
-        if consumed >= max_chars:
-            break
-    return passages
-
-
-def extract(path: Path, max_chars: int = 200_000, *, model_dir: Path | None = None) -> list[Passage]:
+def extract(path: Path, max_chars: int = 200_000, *, model_dir: Path | None = None,
+            cancelled=None, progress=None) -> list[Passage]:
     """Extract bounded, location-labelled text from a supported local file.
 
     Unsupported files (including unknown binary files) return an empty list.
@@ -251,7 +235,14 @@ def extract(path: Path, max_chars: int = 200_000, *, model_dir: Path | None = No
         directory = Path(model_dir) if model_dir is not None else data_directory() / "models"
         return [Passage(text, location) for text, location in extract_image(path, max_chars, directory)]
     if suffix == ".pdf":
-        return _pdf(path, max_chars)
+        from .config import data_directory
+        from .pdf import extract_pdf, PdfReadError
+        directory = Path(model_dir) if model_dir is not None else data_directory() / "models"
+        try:
+            return [Passage(text, location) for text, location in extract_pdf(
+                path, max_chars, directory, cancelled=cancelled, progress=progress)]
+        except PdfReadError as exc:
+            raise ExtractionError(str(exc), [Passage(text, location) for text, location in exc.passages]) from exc
     if suffix in _ARCHIVE_SUFFIXES:
         return _ooxml(path, max_chars)
     if suffix in _TEXT_SUFFIXES:

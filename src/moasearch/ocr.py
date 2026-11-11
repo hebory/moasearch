@@ -41,7 +41,7 @@ def status(model_dir: Path) -> dict:
     elif not present:
         message = "이미지 OCR 모델이 없습니다. 설정에서 OCR 모델을 내려받아 주세요."
     else:
-        message = "한국어·영어 OCR 모델 파일이 준비되었습니다. 최초 사용 시 무결성을 확인합니다."
+        message = "이미지·스캔 PDF용 한국어·영어 OCR 모델이 준비되었습니다. 최초 사용 시 무결성을 확인합니다."
     return {"available": available, "ready": ready, "message": message}
 
 
@@ -133,6 +133,19 @@ def _prepare_frame(image, np):
     return np.asarray(image)[:, :, ::-1].copy()
 
 
+def recognize_frame(image, max_chars: int, model_dir: Path) -> str:
+    """Read a bounded PIL image, including an in-memory rendered PDF page."""
+    if max_chars <= 0:
+        return ""
+    import numpy as np
+
+    pixels = _prepare_frame(image, np)
+    # RapidOCR retains preprocessing state, so all input types share this lock.
+    with _engine_lock:
+        result = _load_engine(Path(model_dir))(pixels)
+    return _ocr_result_text(result)[:max_chars].strip()
+
+
 def extract_image(path: Path, max_chars: int, model_dir: Path) -> list[tuple[str, str]]:
     """Extract Korean/English OCR text from an image without network access.
 
@@ -161,7 +174,6 @@ def extract_image(path: Path, max_chars: int, model_dir: Path) -> list[tuple[str
         _load_engine(Path(model_dir))
 
     try:
-        import numpy as np
         from PIL import Image, UnidentifiedImageError
     except (ImportError, OSError) as exc:
         raise RuntimeError("이미지 OCR 패키지가 설치되지 않았습니다.") from exc
@@ -179,12 +191,7 @@ def extract_image(path: Path, max_chars: int, model_dir: Path) -> list[tuple[str
                     source.seek(frame_index)
                     if source.width * source.height > _MAX_PIXELS:
                         raise ValueError("이미지 해상도가 허용 한도(4천만 픽셀)를 넘었습니다.")
-                    pixels = _prepare_frame(source.copy(), np)
-                    # Serialize both engine lookup and inference. RapidOCR's
-                    # pre/postprocessing objects retain per-call state.
-                    with _engine_lock:
-                        result = _load_engine(Path(model_dir))(pixels)
-                    text = _ocr_result_text(result)
+                    text = recognize_frame(source, max_chars - total_chars, model_dir)
                     if not text:
                         continue
                     text = text[: max_chars - total_chars].strip()
