@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "apps": [
+    {
+      "id": "moasearch",
+      "name": "모아검색",
+      "description": "Google 로컬 AI로 파일의 내용과 의미를 검색합니다. 이미지·스캔 PDF OCR과 HWP/HWPX를 지원합니다.",
+      "category": "파일 · AI 검색",
+      "accentColor": "#436F5D",
+      "monogram": "Ms",
+      "repository": "hebory/moasearch",
+      "iconUrl": "https://raw.githubusercontent.com/hebory/moasearch/master/icon.png",
+      "coverUrl": "https://raw.githubusercontent.com/hebory/moasearch/master/cover.png",
+      "packages": [
+        {
+          "architecture": "x64",
+          "kind": "inno",
+          "assetPattern": "moasearch-*-win-x64-setup.exe",
+          "executablePath": "moasearch.exe",
+          "installDirectory": "Programs/moasearch"
+        }
+      ]
+    }
+  ]
+}

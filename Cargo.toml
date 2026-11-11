@@ -33,6 +33,9 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
+[build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

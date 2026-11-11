@@ -64,6 +64,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(home))
         .route("/static/app.js", get(js))
         .route("/static/style.css", get(css))
+        .route("/static/icon.png", get(icon))
         .route("/api/status", get(status))
         .route("/api/roots", post(add_root))
         .route("/api/roots/{id}", delete(remove_root))
@@ -145,6 +146,12 @@ async fn css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("static/style.css"),
+    )
+}
+async fn icon() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../icon.png").as_slice(),
     )
 }
 async fn status(State(s): State<Arc<AppState>>) -> ApiResult {
