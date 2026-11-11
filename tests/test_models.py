@@ -98,6 +98,42 @@ class ModelDownloadTests(unittest.TestCase):
                 models.download_model("other", self.directory)
         fetch.assert_not_called()
 
+    def ocr_catalog(self):
+        return {role: {"filename": f"{role}.onnx", "bytes": len(content),
+                       "sha256": hashlib.sha256(content).hexdigest(),
+                       "url": f"https://example.invalid/{role}.onnx"}
+                for role, content in [("det", b"onnx detector"), ("rec", b"onnx Korean recognizer")]}
+
+    def test_ocr_downloads_both_pinned_models_without_gguf_signature(self) -> None:
+        progress = []
+        with patch.dict(models._OCR_MODELS, self.ocr_catalog(), clear=True), patch(
+                "moasearch.models.urlopen", side_effect=[Response(b"onnx detector"), Response(b"onnx Korean recognizer")]):
+            result = models.download_model("ocr", self.directory, lambda got, total: progress.append((got, total)))
+            self.assertEqual(result, self.directory)
+            self.assertEqual(set(models.verify_ocr_models(result)), {"det", "rec"})
+        self.assertEqual(progress[-1], (35, 35))
+
+    def test_incomplete_ocr_download_is_not_ready_and_can_resume(self) -> None:
+        with patch.dict(models._OCR_MODELS, self.ocr_catalog(), clear=True):
+            with patch("moasearch.models.urlopen", side_effect=[Response(b"onnx detector"), Response(b"bad recognizer")]):
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    models.download_model("ocr", self.directory)
+            self.assertTrue((self.directory / "det.onnx").is_file())
+            self.assertFalse((self.directory / "rec.onnx").exists())
+            with self.assertRaises(ValueError):
+                models.verify_ocr_models(self.directory)
+            with patch("moasearch.models.urlopen", return_value=Response(b"onnx Korean recognizer")) as fetch:
+                models.download_model("ocr", self.directory)
+                self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(list(self.directory.glob("*.part")), [])
+
+    def test_tampered_ocr_model_is_rejected_before_inference(self) -> None:
+        with patch.dict(models._OCR_MODELS, self.ocr_catalog(), clear=True):
+            (self.directory / "det.onnx").write_bytes(b"onnx detector")
+            (self.directory / "rec.onnx").write_bytes(b"untrusted model")
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                models.verify_ocr_models(self.directory)
+
 
 if __name__ == "__main__":
     unittest.main()

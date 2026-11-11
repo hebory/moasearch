@@ -1,4 +1,4 @@
-"""Pinned downloads for the built-in, on-device GGUF models."""
+"""Pinned downloads for the built-in, on-device GGUF and OCR models."""
 
 from __future__ import annotations
 
@@ -32,11 +32,62 @@ _CATALOG = {
     },
 }
 
+# RapidOCR v3.10.0's official manifest pins these PP-OCRv5 ONNX files.
+_OCR_MODELS = {
+    "det": {
+        "filename": "ch_PP-OCRv5_det_mobile.onnx",
+        "sha256": "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae",
+        "bytes": 4819576,
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_det_mobile.onnx",
+    },
+    "rec": {
+        "filename": "korean_PP-OCRv5_rec_mobile.onnx",
+        "sha256": "cd6e2ea50f6943ca7271eb8c56a877a5a90720b7047fe9c41a2e541a25773c9b",
+        "bytes": 13488748,
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile.onnx",
+    },
+}
+
+
+def ocr_model_paths(directory: Path) -> dict[str, Path]:
+    return {role: Path(directory).resolve() / spec["filename"] for role, spec in _OCR_MODELS.items()}
+
+
+def verify_ocr_models(directory: Path) -> dict[str, Path]:
+    paths = ocr_model_paths(directory)
+    for role, path in paths.items():
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("OCR 모델을 먼저 준비하세요. 설정의 'OCR 모델 받기'를 사용하세요.")
+        if path.stat().st_size > _MAX_DOWNLOAD_BYTES or _digest(path) != _OCR_MODELS[role]["sha256"]:
+            raise ValueError(f"OCR 모델 SHA-256 검증에 실패했습니다: {path.name}")
+    return paths
+
+
+def download_ocr_models(directory: Path, progress=None) -> Path:
+    completed = 0
+    estimates = {role: spec["bytes"] for role, spec in _OCR_MODELS.items()}
+    for role, spec in _OCR_MODELS.items():
+        def report(received, total):
+            estimates[role] = total
+            if progress:
+                progress(completed + received, sum(estimates.values()))
+        target = _download_file(spec, directory, report, gguf=False)
+        completed += target.stat().st_size
+        estimates[role] = target.stat().st_size
+        if progress:
+            progress(completed, sum(estimates.values()))
+    verify_ocr_models(directory)
+    return Path(directory).resolve()
+
 
 def catalog() -> dict:
     """Return public model metadata, without exposing mutable internals."""
     return {kind: {key: value for key, value in item.items() if key != "url"}
-            for kind, item in _CATALOG.items()}
+            for kind, item in _CATALOG.items()} | {"ocr": {
+                "description": "한국어·영어 이미지 OCR (PP-OCRv5, CPU)",
+                "source": "https://github.com/RapidAI/RapidOCR/blob/v3.10.0/python/rapidocr/default_models.yaml",
+                "files": {role: {k: v for k, v in spec.items() if k != "url"} for role, spec in _OCR_MODELS.items()},
+            }}
 
 
 def _digest(path: Path) -> str:
@@ -58,9 +109,14 @@ def download_model(
     checksum and GGUF signature. Any other existing target remains untouched.
     Partial downloads are stored beside the target and removed on every error.
     """
+    if kind == "ocr":
+        return download_ocr_models(directory, progress)
     if kind not in _CATALOG:
-        raise ValueError("모델 종류는 embedding 또는 chat이어야 합니다.")
-    model = _CATALOG[kind]
+        raise ValueError("모델 종류는 embedding, chat 또는 ocr이어야 합니다.")
+    return _download_file(_CATALOG[kind], directory, progress, gguf=True)
+
+
+def _download_file(model, directory, progress=None, *, gguf):
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / model["filename"]
@@ -72,7 +128,7 @@ def download_model(
                 or _digest(target) != model["sha256"]):
             raise FileExistsError("같은 이름의 기존 파일이 올바른 모델이 아니어서 덮어쓰지 않았습니다.")
         with target.open("rb") as stream:
-            if stream.read(4) != b"GGUF":
+            if gguf and stream.read(4) != b"GGUF":
                 raise ValueError("기존 모델 파일의 GGUF 서명이 올바르지 않습니다.")
         return target
 
@@ -102,7 +158,7 @@ def download_model(
         if received < 4:
             raise ValueError("다운로드 파일이 너무 작습니다.")
         with temp.open("rb") as stream:
-            if stream.read(4) != b"GGUF":
+            if gguf and stream.read(4) != b"GGUF":
                 raise ValueError("다운로드 파일이 GGUF 형식이 아닙니다.")
         if digest.hexdigest() != model["sha256"]:
             raise ValueError("모델 SHA-256 검증에 실패했습니다.")
@@ -119,7 +175,7 @@ def download_model(
                     and target.stat().st_size <= _MAX_DOWNLOAD_BYTES
                     and _digest(target) == model["sha256"]):
                 with target.open("rb") as stream:
-                    if stream.read(4) == b"GGUF":
+                    if not gguf or stream.read(4) == b"GGUF":
                         return target
             raise FileExistsError("같은 이름의 파일이 다운로드 중 생겨 모델을 덮어쓰지 않았습니다.")
         return target
