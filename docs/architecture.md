@@ -2,7 +2,7 @@
 
 ## 실행 구조
 
-`moasearch.exe`는 Rust HTTP/CLI 앱이다. 정적 화면 파일을 실행 파일에 포함하고, Axum이 루프백 주소에서만 서비스한다. SQLite는 rusqlite bundled로, AI는 고정된 llama-cpp-2 소스의 llama.cpp를 네이티브 라이브러리로 연결한다. Python·Ollama·AI 서버 프로세스를 실행하지 않는다.
+`moasearch.exe`는 Rust Windows 데스크톱/CLI 앱이다. 기본 실행은 Tao 창과 Wry WebView2를 만들며 외부 브라우저를 열지 않는다. 정적 화면 파일을 실행 파일에 포함하고, 같은 프로세스의 Axum이 루프백 주소에서만 내부 화면과 API를 서비스한다. WebView는 해당 주소로만 이동할 수 있고 새 외부 창·다운로드·추가 권한은 허용하지 않는다. SQLite는 rusqlite bundled로, AI는 고정된 llama-cpp-2 소스의 llama.cpp를 네이티브 라이브러리로 연결한다. Python·Ollama·AI 서버 프로세스를 실행하지 않는다.
 
 - `config.rs`: 저장 위치, 제외 경로, Windows 경로 정규화와 파일 속성 확인
 - `store.rs`: Python 버전과 호환되는 SQLite 스키마, FTS5, 트랜잭션 카운터·변경 버전
@@ -11,6 +11,10 @@
 - `search.rs`: 문자열·정확 코사인 검색, 파일별 최고 청크, RRF, 벡터·질의 캐시
 - `models.rs`, `engine.rs`: 고정 Google 모델 다운로드·검증, 내장 추론
 - `app.rs`, `main.rs`: 로컬 HTTP API·CLI·실행
+- `desktop.rs`: Windows 창, WebView2, 창별 폴더 범위와 마지막 창 종료 처리
+- `launcher.rs`: 탐색기 경로 인자 검증, 같은 데이터 위치의 앱 재사용·창 열기
+
+기본 실행과 `desktop`은 전용 창을 연다. 탐색기의 `open-folder`는 앱 식별·데이터 위치·토큰을 확인한 뒤 `/api/window`로 폴더를 전달한다. 서로 다른 폴더는 독립된 창에서 검색하고 동일 폴더 창은 재사용한다. 마지막 창 닫기 또는 `/api/quit`은 색인을 취소·정리하고 서버와 창을 함께 종료한다. `serve`는 자동화 검증용 창 없는 개발 명령이다.
 
 ## 데이터와 모델 전환
 

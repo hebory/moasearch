@@ -18,8 +18,42 @@ $launcherIconPath = Join-Path $repositoryRoot 'icon.png'
 $launcherCoverPath = Join-Path $repositoryRoot 'cover.png'
 $launcherMetadataPath = Join-Path $repositoryRoot 'moalauncher.json'
 $defaultLicenseDirectory = Join-Path $repositoryRoot '.moasearch-native\release-licenses'
+$webView2BootstrapperUrl = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+$webView2CacheDirectory = Join-Path $repositoryRoot '.moasearch-native\webview2'
+$webView2BootstrapperPath = Join-Path $webView2CacheDirectory 'MicrosoftEdgeWebview2Setup.exe'
 $installerSource = Join-Path $PSScriptRoot 'moasearch.iss'
 if (-not $LicenseDirectory) { $LicenseDirectory = $defaultLicenseDirectory }
+
+New-Item -ItemType Directory -Force -Path $webView2CacheDirectory | Out-Null
+if (-not (Test-Path -LiteralPath $webView2BootstrapperPath -PathType Leaf)) {
+    $downloadPath = Join-Path $webView2CacheDirectory "MicrosoftEdgeWebview2Setup.exe.download-$PID"
+    if (Test-Path -LiteralPath $downloadPath) { throw "기존 WebView2 다운로드 임시 파일을 덮어쓰지 않습니다: $downloadPath" }
+    try {
+        Invoke-WebRequest -Uri $webView2BootstrapperUrl -OutFile $downloadPath -MaximumRedirection 10
+        if (-not (Test-Path -LiteralPath $downloadPath -PathType Leaf) -or (Get-Item -LiteralPath $downloadPath).Length -eq 0) {
+            throw 'Microsoft WebView2 Evergreen Bootstrapper 다운로드 파일이 비어 있습니다.'
+        }
+        $downloadSignature = Get-AuthenticodeSignature -LiteralPath $downloadPath
+        if ($downloadSignature.Status -ne 'Valid' -or $downloadSignature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+            throw "Microsoft WebView2 Evergreen Bootstrapper의 Microsoft 서명을 확인하지 못했습니다: $($downloadSignature.Status); $($downloadSignature.SignerCertificate.Subject)"
+        }
+        if (Test-Path -LiteralPath $webView2BootstrapperPath) { throw "기존 WebView2 캐시를 덮어쓰지 않습니다: $webView2BootstrapperPath" }
+        Move-Item -LiteralPath $downloadPath -Destination $webView2BootstrapperPath
+    } finally {
+        if (Test-Path -LiteralPath $downloadPath) { Remove-Item -LiteralPath $downloadPath -Force }
+    }
+}
+$webView2Signature = Get-AuthenticodeSignature -LiteralPath $webView2BootstrapperPath
+if ($webView2Signature.Status -ne 'Valid' -or $webView2Signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+    throw "캐시된 WebView2 Evergreen Bootstrapper의 Microsoft 서명이 유효하지 않습니다: $webView2BootstrapperPath ($($webView2Signature.Status))"
+}
+$webView2Inventory = [ordered]@{
+    file = 'MicrosoftEdgeWebview2Setup.exe'
+    sha256 = (Get-FileHash -LiteralPath $webView2BootstrapperPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    signature = $webView2Signature.Status.ToString()
+    signer = $webView2Signature.SignerCertificate.Subject
+    source = $webView2BootstrapperUrl
+}
 
 if (-not $Version) {
     $manifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.toml') -Raw
@@ -161,6 +195,7 @@ try {
     foreach ($name in $requiredDistFiles) {
         Copy-Item -LiteralPath (Join-Path $distributionDirectory $name) -Destination $stageDirectory
     }
+    Copy-Item -LiteralPath $webView2BootstrapperPath -Destination $stageDirectory
     Copy-Item -LiteralPath (Join-Path $LicenseDirectory 'THIRD-PARTY-NOTICES.txt') -Destination $stageDirectory
     $stageLicenses = Join-Path $stageDirectory 'licenses'
     New-Item -ItemType Directory -Path $stageLicenses | Out-Null
@@ -250,7 +285,7 @@ try {
         minimumSystem = [ordered]@{ operatingSystem = 'Windows 10/11 x64'; localAiCpu = 'AVX2 required' }
         packagedFiles = $payloadInventory
         licenses = @($licenseInventory)
-        runtime = [ordered]@{ source = $(if ($CrtDirectory -eq (Join-Path $env:SystemRoot 'System32')) { 'Windows System32' } else { 'Supplied Microsoft-signed CRT directory' }); msvcProductVersion = $crtVersion.ToString(); minimumMsvcProductVersion = '14.39.0.0'; files = @($crtInventory) }
+        runtime = [ordered]@{ source = $(if ($CrtDirectory -eq (Join-Path $env:SystemRoot 'System32')) { 'Windows System32' } else { 'Supplied Microsoft-signed CRT directory' }); msvcProductVersion = $crtVersion.ToString(); minimumMsvcProductVersion = '14.39.0.0'; files = @($crtInventory); webView2 = $webView2Inventory }
         models = [ordered]@{ bundled = $false; googleEmbedding = 'EmbeddingGemma 2 Q8_0'; googleChat = 'Gemma 4 E2B QAT Q4_0'; ocr = 'PP-OCRv5 Korean ONNX'; downloadAfterInstall = $true }
         branding = [ordered]@{ installerIcon = 'assets/branding/moasearch.ico'; installerIconSha256 = (Get-FileHash -LiteralPath $iconPath -Algorithm SHA256).Hash.ToLowerInvariant() }
         signature = [ordered]@{ codeSigned = $false; setupSigned = $false }

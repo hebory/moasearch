@@ -4,7 +4,7 @@
 
 내 PC의 파일 이름과 문서 내용을 한국어로 검색하는 Windows용 **Rust 앱**입니다. 선택한 폴더를 SQLite에 색인하고, Google EmbeddingGemma 2로 자연어 검색하며, Google Gemma 4 E2B로 검색한 문서를 근거로 답변합니다.
 
-Python·Ollama·별도 AI 서버는 필요하지 않습니다. Rust 실행 파일에 연결한 llama.cpp가 모델을 같은 프로세스에서 실행합니다. 화면은 앱이 여는 `http://127.0.0.1:8765`에서 사용합니다. 모델 설치 후 문서 처리·검색·추론은 인터넷 없이 동작합니다.
+Windows 설치형 데스크톱 앱으로, 실행하면 **모아검색 전용 창**이 열립니다. 화면은 내장 WebView2에 표시하며 브라우저를 별도로 열지 않습니다. Python·Ollama·별도 AI 서버는 필요하지 않습니다. Rust 실행 파일에 연결한 llama.cpp가 모델을 같은 프로세스에서 실행합니다. 모델 설치 후 문서 처리·검색·추론은 인터넷 없이 동작합니다.
 
 ## 설치와 모아런처 등록
 
@@ -15,6 +15,24 @@ Python·Ollama·별도 AI 서버는 필요하지 않습니다. Rust 실행 파�
 처음 실행하면 앱의 **AI 설정**에서 Google 임베딩·답변 모델과 OCR 모델을 준비하세요. 모델 합계 약 3.68 GB는 설치 패키지에 포함하지 않습니다. 모델 없이도 파일명·일반 문서 키워드 검색을 사용할 수 있습니다.
 
 등록 형식과 패키지 재현 방법은 [릴리스 문서](docs/releasing.md), 이미지 원본과 생성 프롬프트는 [이미지 문서](docs/artwork.md)에 있습니다.
+
+## 탐색기에서 현재 폴더 검색
+
+v0.3.0 설치 파일의 **탐색기에서 현재 폴더 검색** 옵션을 켜면, 폴더 또는 폴더 안의 빈 공간을 우클릭해 **모아검색으로 여기서 검색**을 선택할 수 있습니다. Windows 11에서는 **추가 옵션 표시**에 나타날 수 있습니다. 포터블 ZIP은 메뉴를 자동 등록하지 않습니다.
+
+검색 화면에 선택한 폴더가 표시되고, 파일명·본문·자연어 검색과 AI 답변의 근거가 해당 폴더와 하위 폴더로 제한됩니다. 범위는 앱 창마다 유지하며 **범위 해제**를 눌러 등록된 전체 위치로 돌아갑니다. 경로가 잘못되거나 삭제되면 오류를 표시하고 검색을 중단합니다.
+
+아직 색인하지 않은 폴더는 **색인 시작**을 누르세요. 등록되지 않은 위치는 검색 위치에 추가하며, 기존에 등록된 다른 위치도 함께 갱신합니다. 검색 결과는 선택한 범위로 유지합니다. 상위 폴더가 이미 등록되어 있으면 중복 등록하지 않습니다.
+
+앱이 꺼져 있으면 전용 창을 열고, 같은 데이터 위치와 기본 포트(8765)의 앱이 실행 중이면 재사용합니다. 같은 폴더 창은 다시 활성화하고 다른 폴더는 새 창에서 검색합니다. 마지막 창을 닫거나 **앱 종료**를 누르면 진행 중인 색인을 안전하게 정리하고 앱을 종료합니다. 구버전 앱이 실행 중이면 먼저 종료한 뒤 다시 시도하세요. 설치 옵션을 해제해 다시 설치하거나 앱을 제거하면 탐색기 메뉴도 제거됩니다.
+
+```powershell
+.\dist\moasearch.exe open-folder --path 'D:\문서\계약' | Out-Host
+.\dist\moasearch.exe search '보증금 반환 조건' --folder 'D:\문서\계약' | Out-Host
+.\dist\moasearch.exe answer '반환 기한은 언제인가요?' --folder 'D:\문서\계약' | Out-Host
+```
+
+별도 포트로 실행한 앱에 연결할 때는 `open-folder --port <포트>`를 지정합니다.
 
 ## 소스에서 실행
 
@@ -37,7 +55,7 @@ Python·Ollama·별도 AI 서버는 필요하지 않습니다. Rust 실행 파�
 빌드 스크립트는 Microsoft ONNX Runtime 1.28.0 CPU DLL을 고정 SHA-256으로 검증하여 배포 폴더에 포함합니다. OCR 런타임의 원격 진단 전송은 끕니다.
 
 ```powershell
-.\dist\moasearch.exe doctor
+.\dist\moasearch.exe doctor | Out-Host
 .\start.ps1 -NoBrowser -DataDir .moasearch-dev
 ```
 
@@ -80,18 +98,18 @@ HWP3, 암호화·배포용 HWP, 구형 DOC, 오디오 전사·동영상 분석�
 ## 명령행
 
 ```powershell
-.\dist\moasearch.exe models list
-.\dist\moasearch.exe models download embedding
-.\dist\moasearch.exe models download chat
-.\dist\moasearch.exe models download ocr
-.\dist\moasearch.exe index "$env:USERPROFILE\Documents"
-.\dist\moasearch.exe search "지난 분기 회의 일정"
-.\dist\moasearch.exe search --keyword "invoice-2026-031"
-.\dist\moasearch.exe answer "보증금을 언제 돌려받나요?"
-.\dist\moasearch.exe --data-dir "D:\MoaSearchData" serve --no-browser
+.\dist\moasearch.exe models list | Out-Host
+.\dist\moasearch.exe models download embedding | Out-Host
+.\dist\moasearch.exe models download chat | Out-Host
+.\dist\moasearch.exe models download ocr | Out-Host
+.\dist\moasearch.exe index "$env:USERPROFILE\Documents" | Out-Host
+.\dist\moasearch.exe search "지난 분기 회의 일정" | Out-Host
+.\dist\moasearch.exe search --keyword "invoice-2026-031" | Out-Host
+.\dist\moasearch.exe answer "보증금을 언제 돌려받나요?" | Out-Host
+.\dist\moasearch.exe --data-dir "D:\MoaSearchData" serve --no-browser | Out-Host
 ```
 
-`--data-dir` 또는 `MOASEARCH_DATA_DIR`로 모든 명령의 저장 위치를 바꿀 수 있습니다. 모델이 없어도 키워드 색인과 검색은 사용할 수 있습니다.
+Windows GUI 실행 파일이므로 PowerShell에서 명령 완료와 출력을 기다릴 때는 예제처럼 `| Out-Host`를 붙입니다. `--data-dir` 또는 `MOASEARCH_DATA_DIR`로 모든 명령의 저장 위치를 바꿀 수 있습니다. 모델이 없어도 키워드 색인과 검색은 사용할 수 있습니다.
 
 ## 개발·검증
 
@@ -122,3 +140,5 @@ cargo run --release --locked --example smoke_formats -- .moasearch-verify-format
 - [OAR-OCR](https://github.com/GreatV/oar-ocr), [RapidOCR 모델](https://rapidai.github.io/RapidOCRDocs/main/en/model_licenses/): Rust ONNX OCR 파이프라인과 한국어 전용 OCR 모델. 사전 출처는 `assets/ocr/README.md`에 기록합니다.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp), [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs): 앱 내 추론 엔진. Cargo.lock으로 의존성을 고정합니다.
 - [DigUp](https://github.com/ARahim3/DigUp): 로컬 파일 추출·의미 검색과 Google 임베딩 모델 선택의 참고 프로젝트입니다. 모아검색의 코드는 별도로 구현했습니다.
+
+화면을 표시하는 Microsoft WebView2 Runtime이 없는 PC에서는 설치 중 공식 Runtime을 내려받으므로 인터넷이 필요합니다. 포터블 ZIP에서는 포함된 MicrosoftEdgeWebview2Setup.exe를 먼저 실행하세요.

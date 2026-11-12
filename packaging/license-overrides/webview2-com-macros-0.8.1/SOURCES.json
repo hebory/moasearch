@@ -1,0 +1,11 @@
+{
+  "package": "webview2-com-macros-0.8.1",
+  "provenance": "Cargo declares SPDX MIT; .cargo_vcs_info pins wravery/webview2-rs commit dffa41a8a46d3f5565eefbff2de57d38d399f158, path crates/callback-macros. Copied the repository-root LICENSE verbatim from that pinned commit.",
+  "licenses": [
+    {
+      "file": "LICENSE",
+      "sourceUrl": "https://raw.githubusercontent.com/wravery/webview2-rs/dffa41a8a46d3f5565eefbff2de57d38d399f158/LICENSE",
+      "sha256": "49eef2524ddf5014eaf4ee48d716029eb5cc28d34c0b17f528f5bbe00ed1a733"
+    }
+  ]
+}
