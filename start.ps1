@@ -5,8 +5,7 @@ $appExe = Join-Path $PSScriptRoot 'dist\moasearch.exe'
 if (-not (Test-Path -LiteralPath $appExe)) { & (Join-Path $PSScriptRoot 'build.ps1') }
 $launchArgs = @()
 if ($DataDir) { $launchArgs += @('--data-dir', $DataDir) }
-$launchArgs += @('serve', '--port', "$Port")
-if ($NoBrowser) { $launchArgs += '--no-browser' }
-& $appExe @launchArgs
+$launchArgs += @($(if ($NoBrowser) { 'serve' } else { 'desktop' }), '--port', "$Port")
+& $appExe @launchArgs | Out-Host
 exit $LASTEXITCODE
 

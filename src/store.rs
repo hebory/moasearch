@@ -254,6 +254,22 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Whether the index contains at least one file under the selected folder.
+    pub fn has_files_in(&self, folder: &Path) -> Result<bool> {
+        let pattern = crate::search::scope_like(folder);
+        let db = self.connect()?;
+        let mut stmt =
+            db.prepare("SELECT path FROM files WHERE path LIKE ? ESCAPE '\\' COLLATE NOCASE")?;
+        let mut rows = stmt.query([pattern])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            if crate::search::folder_contains_path(folder, Path::new(&path)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn add_root(&self, raw_path: impl AsRef<Path>) -> Result<Value> {
         let path = canonical(raw_path.as_ref())?;
         if !path.is_dir() {

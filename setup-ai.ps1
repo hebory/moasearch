@@ -6,13 +6,13 @@ if (-not (Test-Path -LiteralPath $appExe)) { & (Join-Path $PSScriptRoot 'build.p
 $baseArgs = @()
 if ($DataDir) { $baseArgs += @('--data-dir', $DataDir) }
 if (-not $SkipModels) {
-    & $appExe @baseArgs models download embedding
+    & $appExe @baseArgs models download embedding | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'EmbeddingGemma 모델 준비에 실패했습니다.' }
-    & $appExe @baseArgs models download chat
+    & $appExe @baseArgs models download chat | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'Gemma 답변 모델 준비에 실패했습니다.' }
-    & $appExe @baseArgs models download ocr
+    & $appExe @baseArgs models download ocr | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'OCR 모델 준비에 실패했습니다.' }
 }
-& $appExe @baseArgs doctor
+& $appExe @baseArgs doctor | Out-Host
 exit $LASTEXITCODE
 

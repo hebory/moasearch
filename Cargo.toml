@@ -1,6 +1,6 @@
 [package]
 name = "moasearch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Rust와 Google 로컬 모델로 동작하는 개인 파일 검색"
 
@@ -27,11 +27,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+tao = "=0.37.2"
+wry = "=0.57.1"
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 winresource = "0.1"

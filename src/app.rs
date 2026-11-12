@@ -18,13 +18,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+type DesktopHandler = Arc<dyn Fn(Option<PathBuf>) -> Result<()> + Send + Sync>;
+
 pub struct AppState {
     pub store: Arc<Store>,
     pub engine: Arc<EmbeddedEngine>,
     pub indexer: Arc<Indexer>,
     pub search: Arc<Search>,
     pub token: String,
+    pub shutdown: tokio::sync::Notify,
     download: Mutex<Value>,
+    desktop: Mutex<Option<DesktopHandler>>,
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
 pub struct ApiError(anyhow::Error);
@@ -53,10 +57,15 @@ impl AppState {
             token: (0..32)
                 .map(|_| format!("{:02x}", rand::random::<u8>()))
                 .collect(),
+            shutdown: tokio::sync::Notify::new(),
+            desktop: Mutex::new(None),
             download: Mutex::new(
                 json!({"running":false,"kind":"","received":0,"total":0,"error":"","message":""}),
             ),
         })
+    }
+    pub fn set_desktop_handler(&self, handler: DesktopHandler) {
+        *self.desktop.lock().unwrap() = Some(handler);
     }
 }
 pub fn router(state: Arc<AppState>) -> Router {
@@ -66,6 +75,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/static/style.css", get(css))
         .route("/static/icon.png", get(icon))
         .route("/api/status", get(status))
+        .route("/api/instance", get(instance))
+        .route("/api/window", post(open_window))
+        .route("/api/scope", post(scope))
+        .route("/api/quit", post(quit))
         .route("/api/roots", post(add_root))
         .route("/api/roots/{id}", delete(remove_root))
         .route("/api/index", post(start_index))
@@ -158,6 +171,59 @@ async fn status(State(s): State<Arc<AppState>>) -> ApiResult {
     blocking(move||Ok(json!({"counts":s.store.counts()?,"roots":s.store.roots()?,"settings":s.store.settings()?,
         "index":s.indexer.status(),"engine":s.engine.status(),"ocr":ocr::status(&s.store.data_dir.join("models")),"suggestions":suggestions(),"model_download":s.download.lock().unwrap().clone()}))).await
 }
+async fn instance(State(s): State<Arc<AppState>>) -> Json<Value> {
+    Json(
+        json!({"app":"moasearch", "version":env!("CARGO_PKG_VERSION"),
+        "folder_protocol":1, "desktop":s.desktop.lock().unwrap().is_some(),
+        "data_dir":s.store.data_dir, "pid":std::process::id()}),
+    )
+}
+#[derive(Deserialize)]
+struct WindowInput {
+    folder: Option<String>,
+}
+async fn open_window(State(s): State<Arc<AppState>>, Json(body): Json<WindowInput>) -> ApiResult {
+    blocking(move || {
+        let folder = body
+            .folder
+            .map(|path| crate::search::canonical_folder(Path::new(&path)))
+            .transpose()?;
+        let handler = s.desktop.lock().unwrap().clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "개발 서버에는 앱 창이 없습니다. 서버를 종료한 뒤 모아검색을 실행하세요."
+            )
+        })?;
+        handler(folder)?;
+        Ok(json!({"ok":true}))
+    })
+    .await
+}
+async fn quit(State(s): State<Arc<AppState>>) -> Json<Value> {
+    s.shutdown.notify_one();
+    Json(json!({"ok":true}))
+}
+
+async fn scope(State(s): State<Arc<AppState>>, Json(body): Json<RootInput>) -> ApiResult {
+    blocking(move || {
+        let folder = crate::search::canonical_folder(Path::new(&body.path))?;
+        let roots = s.store.roots()?;
+        let covering = roots
+            .iter()
+            .filter_map(|root| root["path"].as_str())
+            .find(|root| crate::search::folder_contains_path(Path::new(root), &folder));
+        let registered = roots
+            .iter()
+            .filter_map(|root| root["path"].as_str())
+            .any(|root| {
+                config::within(&folder, Path::new(root)) && config::within(Path::new(root), &folder)
+            });
+        Ok(
+            json!({"path":folder,"indexed":s.store.has_files_in(&folder)?,
+            "registered":registered,"covered":covering.is_some(),"root_path":covering}),
+        )
+    })
+    .await
+}
 fn suggestions() -> Vec<Value> {
     let mut result = Vec::new();
     if let Some(home) = std::env::var_os("USERPROFILE") {
@@ -234,6 +300,8 @@ struct SearchInput {
     extension: Option<String>,
     #[serde(default = "default_mode")]
     mode: String,
+    #[serde(default)]
+    folder: Option<String>,
 }
 fn default_limit() -> usize {
     30
@@ -265,11 +333,12 @@ impl SearchInput {
 async fn search(State(s): State<Arc<AppState>>, Json(body): Json<SearchInput>) -> ApiResult {
     blocking(move || {
         body.validate()?;
-        s.search.search(
+        s.search.search_in(
             &body.query,
             body.limit,
             body.extension.as_deref(),
             &body.mode,
+            body.folder.as_deref().map(Path::new),
         )
     })
     .await
@@ -277,7 +346,11 @@ async fn search(State(s): State<Arc<AppState>>, Json(body): Json<SearchInput>) -
 async fn answer(State(s): State<Arc<AppState>>, Json(body): Json<SearchInput>) -> ApiResult {
     blocking(move || {
         body.validate()?;
-        s.search.answer(&body.query, body.limit.min(8))
+        s.search.answer_in(
+            &body.query,
+            body.limit.min(8),
+            body.folder.as_deref().map(Path::new),
+        )
     })
     .await
 }

@@ -2,11 +2,12 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, params_from_iter};
 use serde_json::{Value, json};
 
 use crate::engine::Embedder;
@@ -20,6 +21,7 @@ struct VectorRow {
     chunk_id: i64,
     file_id: i64,
     extension_id: u32,
+    path_id: usize,
 }
 
 #[derive(Debug)]
@@ -30,6 +32,7 @@ struct VectorSnapshot {
     rows: Vec<VectorRow>,
     vectors: Vec<f32>,
     extensions: Vec<String>,
+    paths: Vec<PathBuf>,
 }
 
 impl VectorSnapshot {
@@ -37,15 +40,25 @@ impl VectorSnapshot {
         &self,
         query: &[f32],
         extension: Option<&str>,
+        folder: Option<&Path>,
         file_limit: usize,
     ) -> Vec<(f32, i64)> {
         if self.dimension != query.len() {
             return Vec::new();
         }
+        let path_allowed = folder.map(|folder| {
+            self.paths
+                .iter()
+                .map(|path| folder_contains_path(folder, path))
+                .collect::<Vec<_>>()
+        });
         let mut best_by_file: HashMap<i64, (f32, i64)> = HashMap::new();
         for (index, row) in self.rows.iter().enumerate() {
             if extension
                 .is_some_and(|extension| self.extensions[row.extension_id as usize] != extension)
+                || path_allowed
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed[row.path_id])
             {
                 continue;
             }
@@ -97,13 +110,21 @@ impl VectorCache {
             [model_id],
             |row| row.get(0),
         )?;
+        let path_bytes: i64 = db.query_row(
+            "SELECT COALESCE(sum(length(CAST(path AS BLOB)) + 64), 0) FROM files
+             WHERE id IN (SELECT DISTINCT file_id FROM chunks
+                          WHERE model_id=?1 AND vector IS NOT NULL)",
+            [model_id],
+            |row| row.get(0),
+        )?;
         let row_bytes = dimension
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_add(std::mem::size_of::<VectorRow>())
             .saturating_add(32);
         let estimated = usize::try_from(count)
             .unwrap_or(usize::MAX)
-            .saturating_mul(row_bytes);
+            .saturating_mul(row_bytes)
+            .saturating_add(usize::try_from(path_bytes).unwrap_or(usize::MAX));
         if estimated > byte_limit {
             return Ok(None);
         }
@@ -119,8 +140,10 @@ impl VectorCache {
         }
         let mut extension_ids = HashMap::<String, u32>::new();
         let mut extensions = Vec::new();
+        let mut path_ids = HashMap::<i64, usize>::new();
+        let mut paths = Vec::new();
         let mut stmt = db.prepare(
-            "SELECT c.id,c.file_id,f.extension,c.vector FROM chunks c
+            "SELECT c.id,c.file_id,f.extension,c.vector,f.path FROM chunks c
              JOIN files f ON f.id=c.file_id
              WHERE c.model_id=?1 AND c.vector IS NOT NULL ORDER BY c.file_id,c.id",
         )?;
@@ -130,11 +153,12 @@ impl VectorCache {
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let mut bytes = 0usize;
         for item in mapped {
-            let (chunk_id, file_id, extension, raw) = item?;
+            let (chunk_id, file_id, extension, raw, path) = item?;
             let Some(mut vector) = decode_vector(&raw) else {
                 continue;
             };
@@ -142,6 +166,7 @@ impl VectorCache {
                 continue;
             }
             normalize(&mut vector);
+            let path_bytes = path.len();
             let extension_id = if let Some(id) = extension_ids.get(&extension) {
                 *id
             } else {
@@ -150,13 +175,25 @@ impl VectorCache {
                 extensions.push(extension);
                 id
             };
+            let (path_id, is_new_path) = if let Some(id) = path_ids.get(&file_id) {
+                (*id, false)
+            } else {
+                let id = paths.len();
+                paths.push(PathBuf::from(path));
+                path_ids.insert(file_id, id);
+                (id, true)
+            };
             bytes = bytes.saturating_add(
                 vector.len() * std::mem::size_of::<f32>() + std::mem::size_of::<VectorRow>(),
             );
+            if is_new_path {
+                bytes = bytes.saturating_add(path_bytes + 64);
+            }
             rows.push(VectorRow {
                 chunk_id,
                 file_id,
                 extension_id,
+                path_id,
             });
             vectors.extend_from_slice(&vector);
         }
@@ -170,10 +207,78 @@ impl VectorCache {
             rows,
             vectors,
             extensions,
+            paths,
         });
         self.snapshot = Some(snapshot.clone());
         Ok(Some(snapshot))
     }
+}
+
+/// Canonicalize an existing directory selected for a folder-scoped search.
+pub fn canonical_folder(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() || path.to_str().is_some_and(|value| value.trim().is_empty()) {
+        return Err(anyhow!("검색 폴더를 지정하세요."));
+    }
+    let folder = crate::config::canonical(path)?;
+    if !folder.is_dir() {
+        return Err(anyhow!("검색 범위는 접근 가능한 폴더여야 합니다."));
+    }
+    if folder.to_str().is_none() {
+        return Err(anyhow!("검색 폴더 경로는 유니코드 문자열이어야 합니다."));
+    }
+    Ok(folder)
+}
+
+/// Check path containment on complete path components, accounting for Windows case.
+pub fn folder_contains_path(folder: &Path, candidate: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        let folder = normalize(folder);
+        let candidate = normalize(candidate);
+        candidate == folder
+            || candidate
+                .strip_prefix(&folder)
+                .is_some_and(|suffix| suffix.starts_with('\\'))
+    }
+    #[cfg(not(windows))]
+    {
+        candidate == folder || candidate.starts_with(folder)
+    }
+}
+
+pub(crate) fn scope_like(folder: &Path) -> String {
+    let mut prefix = folder.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        prefix = prefix.replace('/', "\\");
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    while prefix.ends_with(separator) && prefix.len() > 1 {
+        // Keep the separator in drive roots (for example, C:\\).
+        if cfg!(windows) && prefix.len() == 3 && prefix.as_bytes()[1] == b':' {
+            break;
+        }
+        prefix.pop();
+    }
+    let boundary = if prefix.ends_with(separator) {
+        String::new()
+    } else {
+        separator.to_string()
+    };
+    let literal_prefix = prefix + &boundary;
+    format!(
+        "{}%",
+        literal_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
 }
 
 #[derive(Default)]
@@ -235,11 +340,24 @@ impl Search {
         extension: Option<&str>,
         mode: &str,
     ) -> Result<Value> {
+        self.search_in(query, limit, extension, mode, None)
+    }
+
+    pub fn search_in(
+        &self,
+        query: &str,
+        limit: usize,
+        extension: Option<&str>,
+        mode: &str,
+        folder: Option<&Path>,
+    ) -> Result<Value> {
         let query = query.trim();
         if query.is_empty() || query.chars().count() > 2000 {
             return Err(anyhow!("검색어는 1~2,000자로 입력하세요."));
         }
         let limit = limit.clamp(1, 100);
+        let folder = folder.map(canonical_folder).transpose()?;
+        let folder = folder.as_deref();
         let terms = terms(query);
         let extension = extension
             .filter(|value| !value.trim().is_empty())
@@ -253,6 +371,7 @@ impl Search {
                 &db,
                 &terms,
                 extension.as_deref(),
+                folder,
                 &mut hits,
                 &mut next_hit_order,
             )?;
@@ -267,6 +386,7 @@ impl Search {
                             &model_id,
                             &query_vector,
                             extension.as_deref(),
+                            folder,
                             limit,
                             &mut hits,
                             &mut next_hit_order,
@@ -318,7 +438,11 @@ impl Search {
     }
 
     pub fn answer(&self, query: &str, limit: usize) -> Result<Value> {
-        let result = self.search(query, limit.clamp(1, 8), None, "hybrid")?;
+        self.answer_in(query, limit, None)
+    }
+
+    pub fn answer_in(&self, query: &str, limit: usize, folder: Option<&Path>) -> Result<Value> {
+        let result = self.search_in(query, limit.clamp(1, 8), None, "hybrid", folder)?;
         let sources: Vec<Value> = result["results"]
             .as_array()
             .into_iter()
@@ -374,6 +498,7 @@ impl Search {
         model_id: &str,
         query: &[f32],
         extension: Option<&str>,
+        folder: Option<&Path>,
         limit: usize,
         hits: &mut HashMap<i64, Hit>,
         next_hit_order: &mut usize,
@@ -396,8 +521,8 @@ impl Search {
             )?
         };
         let ranked = match snapshot {
-            Some(snapshot) => snapshot.candidates(query, extension, candidate_limit),
-            None => streaming_candidates(&tx, model_id, query, extension, candidate_limit)?,
+            Some(snapshot) => snapshot.candidates(query, extension, folder, candidate_limit),
+            None => streaming_candidates(&tx, model_id, query, extension, folder, candidate_limit)?,
         };
         let has_candidates = !ranked.is_empty();
         let placeholders = std::iter::repeat("?")
@@ -449,6 +574,7 @@ fn keyword_search(
     db: &Connection,
     terms: &[String],
     extension: Option<&str>,
+    folder: Option<&Path>,
     hits: &mut HashMap<i64, Hit>,
     next_hit_order: &mut usize,
 ) -> Result<()> {
@@ -457,6 +583,11 @@ fn keyword_search(
     }
     let ext_sql = if extension.is_some() {
         " AND f.extension=?"
+    } else {
+        ""
+    };
+    let folder_sql = if folder.is_some() {
+        " AND f.path LIKE ? ESCAPE '\\' COLLATE NOCASE"
     } else {
         ""
     };
@@ -492,12 +623,16 @@ fn keyword_search(
     }
     let path_clause = path_parts.join(" OR ");
     let path_query = format!(
-        "SELECT f.*, '' AS text, '파일명·경로' AS location FROM files f WHERE ({path_clause}){ext_sql} ORDER BY f.modified DESC LIMIT 300"
+        "SELECT f.*, '' AS text, '파일명·경로' AS location FROM files f WHERE ({path_clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC LIMIT 300"
     );
     let path_extension = extension.map(str::to_string);
     let mut path_values: Vec<&dyn rusqlite::ToSql> = path_params.iter().map(|s| s as _).collect();
     if let Some(extension) = path_extension.as_ref() {
         path_values.push(extension);
+    }
+    let folder_pattern = folder.map(scope_like);
+    if let Some(pattern) = folder_pattern.as_ref() {
+        path_values.push(pattern);
     }
     let mut path_stmt = db.prepare(&path_query)?;
     let mut path_rows = path_stmt
@@ -508,6 +643,13 @@ fn keyword_search(
             Ok(file)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    path_rows.retain(|row| {
+        folder.is_none_or(|folder| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| folder_contains_path(folder, Path::new(path)))
+        })
+    });
     path_rows.sort_by(|a, b| {
         name_match_count(b, terms)
             .cmp(&name_match_count(a, terms))
@@ -528,12 +670,15 @@ fn keyword_search(
         let sql = format!(
             "SELECT f.*,c.text,c.location FROM chunks_fts
              JOIN chunks c ON c.id=chunks_fts.rowid JOIN files f ON f.id=c.file_id
-             WHERE chunks_fts MATCH ?{ext_sql} ORDER BY bm25(chunks_fts) LIMIT 400"
+             WHERE chunks_fts MATCH ?{ext_sql}{folder_sql} ORDER BY bm25(chunks_fts) LIMIT 400"
         );
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&expression];
         let fts_extension = extension.map(str::to_string);
         if let Some(extension) = fts_extension.as_ref() {
             values.push(extension);
+        }
+        if let Some(pattern) = folder_pattern.as_ref() {
+            values.push(pattern);
         }
         let mut stmt = db.prepare(&sql)?;
         content_rows.extend(
@@ -552,7 +697,7 @@ fn keyword_search(
             .join(" OR ");
         let sql = format!(
             "SELECT f.*,c.text,c.location FROM chunks c JOIN files f ON f.id=c.file_id
-             WHERE ({clause}){ext_sql} ORDER BY f.modified DESC LIMIT 200"
+             WHERE ({clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC LIMIT 200"
         );
         let patterns: Vec<String> = short_terms.iter().map(|term| like(term)).collect();
         let mut values: Vec<&dyn rusqlite::ToSql> = patterns.iter().map(|s| s as _).collect();
@@ -560,12 +705,22 @@ fn keyword_search(
         if let Some(extension) = short_extension.as_ref() {
             values.push(extension);
         }
+        if let Some(pattern) = folder_pattern.as_ref() {
+            values.push(pattern);
+        }
         let mut stmt = db.prepare(&sql)?;
         content_rows.extend(
             stmt.query_map(params_from_iter(values), joined_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
     }
+    content_rows.retain(|row| {
+        folder.is_none_or(|folder| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| folder_contains_path(folder, Path::new(path)))
+        })
+    });
     let mut seen = HashSet::new();
     for row in content_rows {
         let id = row["id"].as_i64().unwrap_or_default();
@@ -652,33 +807,57 @@ fn streaming_candidates(
     model_id: &str,
     query: &[f32],
     extension: Option<&str>,
+    folder: Option<&Path>,
     file_limit: usize,
 ) -> Result<Vec<(f32, i64)>> {
     let mut sql = String::from(
-        "SELECT c.id,c.file_id,c.vector FROM chunks c JOIN files f ON f.id=c.file_id
+        "SELECT c.id,c.file_id,c.vector,f.path FROM chunks c JOIN files f ON f.id=c.file_id
          WHERE c.model_id=?1 AND c.vector IS NOT NULL",
     );
     if extension.is_some() {
         sql.push_str(" AND f.extension=?2");
     }
+    if folder.is_some() {
+        sql.push_str(if extension.is_some() {
+            " AND f.path LIKE ?3 ESCAPE '\\' COLLATE NOCASE"
+        } else {
+            " AND f.path LIKE ?2 ESCAPE '\\' COLLATE NOCASE"
+        });
+    }
     sql.push_str(" ORDER BY c.file_id,c.id");
     let mut stmt = db.prepare(&sql)?;
-    let mut rows = if let Some(extension) = extension {
-        stmt.query(params![model_id, extension])?
-    } else {
-        stmt.query([model_id])?
-    };
+    let folder_pattern = folder.map(scope_like);
+    let mut sql_values: Vec<&dyn rusqlite::ToSql> = vec![&model_id];
+    let extension_value = extension.map(str::to_string);
+    if let Some(extension) = extension_value.as_ref() {
+        sql_values.push(extension);
+    }
+    if let Some(pattern) = folder_pattern.as_ref() {
+        sql_values.push(pattern);
+    }
+    let mut rows = stmt.query(params_from_iter(sql_values))?;
     let mut top = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
     let mut current_file = None;
+    let mut current_file_in_scope = true;
     let mut current_best: Option<Candidate> = None;
     while let Some(row) = rows.next()? {
         let chunk_id: i64 = row.get(0)?;
         let file_id: i64 = row.get(1)?;
         let raw: Vec<u8> = row.get(2)?;
+        let path: String = row.get(3)?;
         if current_file.is_some_and(|previous| previous != file_id) {
             retain(&mut top, current_best.take(), file_limit);
+            current_file_in_scope =
+                folder.is_none_or(|folder| folder_contains_path(folder, Path::new(&path)));
+        } else if current_file.is_none() {
+            current_file_in_scope =
+                folder.is_none_or(|folder| folder_contains_path(folder, Path::new(&path)));
         }
         current_file = Some(file_id);
+        if !current_file_in_scope {
+            current_best = None;
+            continue;
+        }
         let Some(mut vector) = decode_vector(&raw) else {
             continue;
         };
@@ -767,6 +946,58 @@ fn like(value: &str) -> String {
             .replace('%', "\\%")
             .replace('_', "\\_")
     )
+}
+
+#[cfg(test)]
+mod scope_path_tests {
+    use super::*;
+
+    #[test]
+    fn scope_pattern_escapes_like_wildcards_and_keeps_root_separator() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                scope_like(Path::new(r"C:\문서%_자료\")),
+                r"C:\\문서\%\_자료\\%"
+            );
+            assert_eq!(scope_like(Path::new(r"C:\")), r"C:\\%");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            scope_like(Path::new("/tmp/자료%_폴더")),
+            "/tmp/자료\\%\\_폴더/%"
+        );
+    }
+
+    #[test]
+    fn containment_observes_component_boundaries_and_platform_case_rules() {
+        #[cfg(windows)]
+        {
+            assert!(folder_contains_path(
+                Path::new(r"C:\Users\Me\문서"),
+                Path::new(r"c:\users\me\문서\하위\파일.txt")
+            ));
+            assert!(!folder_contains_path(
+                Path::new(r"C:\Users\Me\문서"),
+                Path::new(r"C:\Users\Me\문서2\파일.txt")
+            ));
+            assert!(!folder_contains_path(
+                Path::new(r"\\server\share\docs"),
+                Path::new(r"\\server\share\docs-other\file.txt")
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(folder_contains_path(
+                Path::new("/tmp/docs"),
+                Path::new("/tmp/docs/sub/file.txt")
+            ));
+            assert!(!folder_contains_path(
+                Path::new("/tmp/docs"),
+                Path::new("/tmp/docs2/file.txt")
+            ));
+        }
+    }
 }
 
 fn name_match_count(file: &Value, terms: &[String]) -> usize {
@@ -865,7 +1096,7 @@ mod tests {
             .collect();
         let record = FileRecord {
             root_id,
-            path,
+            path: crate::config::canonical(&path).unwrap(),
             size: 12,
             modified: 1,
             passages,
@@ -901,30 +1132,34 @@ mod tests {
             revision: 1,
             vectors: vec![1.0, 0.0, 0.0, 1.0, 0.8, 0.6],
             extensions: vec![".txt".into(), ".pdf".into()],
+            paths: vec![PathBuf::from("a.txt"), PathBuf::from("b.pdf")],
             rows: vec![
                 VectorRow {
                     chunk_id: 1,
                     file_id: 10,
                     extension_id: 0,
+                    path_id: 0,
                 },
                 VectorRow {
                     chunk_id: 2,
                     file_id: 10,
                     extension_id: 0,
+                    path_id: 0,
                 },
                 VectorRow {
                     chunk_id: 3,
                     file_id: 20,
                     extension_id: 1,
+                    path_id: 1,
                 },
             ],
         };
         assert_eq!(
-            snapshot.candidates(&[1.0, 0.0], None, 10),
+            snapshot.candidates(&[1.0, 0.0], None, None, 10),
             vec![(1.0, 1), (0.8, 3)]
         );
         assert_eq!(
-            snapshot.candidates(&[1.0, 0.0], Some(".pdf"), 10),
+            snapshot.candidates(&[1.0, 0.0], Some(".pdf"), None, 10),
             vec![(0.8, 3)]
         );
     }
@@ -983,6 +1218,85 @@ mod tests {
             .unwrap();
         assert_eq!(names(&filtered), vec!["negative.txt"]);
         assert!(fallback.vectors.lock().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn scoped_search_filters_keyword_semantic_cache_fallback_and_answer_sources() {
+        let (_temp, store, library, root_id) = fixture();
+        let scope = library.join("scope%_dir");
+        std::fs::create_dir_all(scope.join("nested")).unwrap();
+        std::fs::create_dir_all(library.join("scope%_dir2")).unwrap();
+        add_document(
+            &store,
+            &library,
+            root_id,
+            "scope%_dir/nested/needle-child.txt",
+            vec![vec![1.0, 0.0]],
+            "google-a",
+        );
+        add_document(
+            &store,
+            &library,
+            root_id,
+            "scope%_dir2/needle-sibling.txt",
+            vec![vec![1.0, 0.0]],
+            "google-a",
+        );
+        add_document(
+            &store,
+            &library,
+            root_id,
+            "outside.txt",
+            vec![vec![1.0, 0.0]],
+            "google-a",
+        );
+        let cached = Search::with_cache_limit(
+            store.clone(),
+            Arc::new(FixtureEngine::new("google-a")),
+            1_000_000,
+        );
+        let fallback =
+            Search::with_cache_limit(store.clone(), Arc::new(FixtureEngine::new("google-a")), 0);
+        for search in [&cached, &fallback] {
+            let keyword = search
+                .search_in("needle", 10, None, "keyword", Some(&scope))
+                .unwrap();
+            assert_eq!(keyword["results"].as_array().unwrap().len(), 1);
+            assert_eq!(keyword["results"][0]["name"], "needle-child.txt");
+
+            // This query has no matching text or filename, exercising only
+            // semantic retrieval before the per-file candidate limit.
+            let semantic = search
+                .search_in(
+                    "unmatched semantic intent",
+                    10,
+                    None,
+                    "hybrid",
+                    Some(&scope),
+                )
+                .unwrap();
+            assert_eq!(semantic["results"].as_array().unwrap().len(), 1);
+            assert_eq!(semantic["results"][0]["name"], "needle-child.txt");
+
+            let answer = search
+                .answer_in("unmatched semantic intent", 5, Some(&scope))
+                .unwrap();
+            assert_eq!(answer["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(answer["sources"][0]["name"], "needle-child.txt");
+        }
+        // Reusing a global vector snapshot for another scope must still filter
+        // before ranking, so its results cannot leak across scope changes.
+        let sibling = cached
+            .search_in(
+                "unmatched semantic intent",
+                10,
+                None,
+                "hybrid",
+                Some(&library.join("scope%_dir2")),
+            )
+            .unwrap();
+        assert_eq!(sibling["results"].as_array().unwrap().len(), 1);
+        assert_eq!(sibling["results"][0]["name"], "needle-sibling.txt");
     }
 
     #[test]
