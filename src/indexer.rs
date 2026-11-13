@@ -65,7 +65,7 @@ impl Indexer {
     }
     pub fn start(self: &Arc<Self>) -> bool {
         let _guard = self.mutation.lock().unwrap();
-        if self.ensure_idle().is_err() {
+        if self.stop.load(Ordering::Acquire) || self.ensure_idle().is_err() {
             return false;
         }
         self.cancel_flag.store(false, Ordering::Relaxed);
@@ -95,15 +95,21 @@ impl Indexer {
         self.cancel_flag.load(Ordering::Relaxed)
     }
     pub fn close(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Serialize shutdown with start so a late scheduler/UI command cannot
+        // launch a new scan after close has started.
+        let _guard = self.mutation.lock().unwrap();
+        self.stop.store(true, Ordering::Release);
         self.cancel();
     }
     pub fn start_scheduler(self: &Arc<Self>) {
         let this = self.clone();
         std::thread::spawn(move || {
             let mut last = Instant::now();
-            while !this.stop.load(Ordering::Relaxed) {
+            while !this.stop.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_secs(2));
+                if this.stop.load(Ordering::Acquire) {
+                    break;
+                }
                 let interval = this
                     .store
                     .settings()
@@ -111,6 +117,9 @@ impl Indexer {
                     .and_then(|s| s["scan_interval"].as_u64())
                     .unwrap_or(0);
                 if interval > 0 && last.elapsed() >= Duration::from_secs(interval) {
+                    if this.stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     this.start();
                     last = Instant::now();
                 }

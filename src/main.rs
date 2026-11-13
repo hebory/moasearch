@@ -3,12 +3,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use moasearch::{
-    app::{self, AppState},
+    commands::{Command as AppCommand, SearchInput},
     config,
     engine::EmbeddedEngine,
-    indexer::Indexer,
     models, ocr,
-    search::Search,
+    service::AppServices,
     store::Store,
 };
 use serde_json::{Value, json};
@@ -31,8 +30,6 @@ struct Cli {
 enum Command {
     /// 모아검색 Windows 앱 실행
     Desktop {
-        #[arg(long,default_value_t=8765,value_parser=clap::value_parser!(u16).range(1024..))]
-        port: u16,
         #[arg(long)]
         folder: Option<PathBuf>,
         #[arg(long, hide = true)]
@@ -42,20 +39,12 @@ enum Command {
     OpenFolder {
         #[arg(long)]
         path: PathBuf,
-        #[arg(long,default_value_t=8765,value_parser=clap::value_parser!(u16).range(1024..))]
-        port: u16,
-        /// 창 없는 개발 서버 사용 (자동화 검증용)
-        #[arg(long, hide = true)]
-        no_browser: bool,
     },
-    /// 창 없는 개발 서버 실행
+    /// 실행 중인 데스크톱 앱 확인
     #[command(hide = true)]
-    Serve {
-        #[arg(long,default_value_t=8765,value_parser=clap::value_parser!(u16).range(1024..))]
-        port: u16,
-        #[arg(long, hide = true)]
-        no_browser: bool,
-    },
+    Instance,
+    /// 실행 중인 앱과 색인 작업 종료
+    Quit,
     /// 엔진·Google 모델·Rust OCR 상태 확인
     Doctor,
     /// 지정한 폴더 추가 후 증분 색인
@@ -94,18 +83,8 @@ fn emit(value: Value) {
 fn run() -> Result<()> {
     let args = Cli::parse();
     let store = Arc::new(Store::open(&args.data_dir)?);
-    if let Some(Command::OpenFolder {
-        path,
-        port,
-        no_browser,
-    }) = &args.command
-    {
-        emit(launcher::open_folder(
-            &store.data_dir,
-            path,
-            *port,
-            *no_browser,
-        )?);
+    if let Some(Command::OpenFolder { path }) = &args.command {
+        emit(launcher::open_window(&store.data_dir, Some(path))?);
         return Ok(());
     }
     if let Some(Command::Models { command }) = &args.command {
@@ -140,21 +119,27 @@ fn run() -> Result<()> {
     }
     let engine = Arc::new(EmbeddedEngine::new(store.clone()));
     match args.command.unwrap_or(Command::Desktop {
-        port: 8765,
         folder: None,
         background: false,
     }) {
-        Command::Desktop { port, folder, .. } => {
+        Command::Desktop { folder, background } => {
             let folder = folder
                 .map(|path| moasearch::search::canonical_folder(&path))
                 .transpose()?;
-            if !launcher::focus_existing(&store.data_dir, folder.as_deref(), port)? {
+            if background {
                 #[cfg(windows)]
-                desktop::run(store, engine, folder, port)?;
+                desktop::run(store, engine, folder)?;
                 #[cfg(not(windows))]
                 anyhow::bail!("모아검색 데스크톱 앱은 Windows에서 실행하세요.");
+            } else {
+                emit(launcher::open_window(&store.data_dir, folder.as_deref())?);
             }
         }
+        Command::Instance => emit(
+            launcher::running_instance(&store.data_dir)?
+                .unwrap_or_else(|| json!({"running":false})),
+        ),
+        Command::Quit => emit(launcher::quit(&store.data_dir)?),
         Command::Doctor => emit(
             json!({"runtime":"Rust / llama.cpp (in-process)","data_dir":store.data_dir,"counts":store.counts()?,"settings":store.settings()?,"engine":engine.status(),"ocr":ocr::status(&store.data_dir.join("models"))}),
         ),
@@ -162,17 +147,26 @@ fn run() -> Result<()> {
             query,
             keyword,
             folder,
-        } => emit(Search::new(store, engine).search_in(
-            &query,
-            30,
-            None,
-            if keyword { "keyword" } else { "hybrid" },
-            folder.as_deref(),
+        } => emit(
+            AppServices::new(store, engine).execute(AppCommand::Search(SearchInput {
+                query,
+                limit: 30,
+                extension: None,
+                mode: if keyword { "keyword" } else { "hybrid" }.into(),
+                folder,
+            }))?,
+        ),
+        Command::Answer { query, folder } => emit(AppServices::new(store, engine).execute(
+            AppCommand::Answer(SearchInput {
+                query,
+                limit: 5,
+                extension: None,
+                mode: "hybrid".into(),
+                folder,
+            }),
         )?),
-        Command::Answer { query, folder } => {
-            emit(Search::new(store, engine).answer_in(&query, 5, folder.as_deref())?)
-        }
         Command::Index { paths } => {
+            let services = AppServices::new(store.clone(), engine);
             for path in paths {
                 let resolved = config::canonical(&path)?;
                 if !store
@@ -180,47 +174,23 @@ fn run() -> Result<()> {
                     .iter()
                     .any(|r| r["path"].as_str() == resolved.to_str())
                 {
-                    store.add_root(&resolved)?;
+                    services.execute(AppCommand::AddRoot { path: resolved })?;
                 }
             }
-            let indexer = Indexer::new(store, engine);
+            let indexer = services.indexer.clone();
             let cancel = indexer.clone();
             ctrlc::set_handler(move || cancel.cancel())?;
-            indexer.start();
+            services.execute(AppCommand::StartIndex {})?;
             while indexer.status()["running"] == true {
                 std::thread::sleep(Duration::from_millis(100));
             }
             let status = indexer.status();
+            services.wait_shutdown()?;
             emit(status.clone());
             anyhow::ensure!(
                 status["errors"].as_u64().unwrap_or(0) == 0,
                 "일부 파일을 색인하지 못했습니다. 위 오류를 확인하세요."
             );
-        }
-        Command::Serve { port, .. } => {
-            let state = AppState::new(store, engine);
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(async move {
-                let listener =
-                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-                eprintln!("모아검색 Rust: http://127.0.0.1:{port}");
-                state.indexer.start_scheduler();
-                let shutdown = state.indexer.clone();
-                let requested_shutdown = state.clone();
-                axum::serve(listener, app::router(state))
-                    .with_graceful_shutdown(async move {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {},
-                            _ = requested_shutdown.shutdown.notified() => {},
-                        }
-                        shutdown.close();
-                        while shutdown.status()["running"] == true {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    })
-                    .await?;
-                Ok::<_, anyhow::Error>(())
-            })?;
         }
         Command::Models { .. } | Command::OpenFolder { .. } => unreachable!(),
     }
@@ -255,9 +225,9 @@ fn main() {
                     .iter()
                     .any(|arg| arg == "desktop" || arg == "open-folder");
             if interactive
-                && !arguments.iter().any(|arg| {
-                    arg == "--no-browser" || arg == "--background" || arg == "--no-dialog"
-                })
+                && !arguments
+                    .iter()
+                    .any(|arg| arg == "--background" || arg == "--no-dialog")
             {
                 use windows::{
                     Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},

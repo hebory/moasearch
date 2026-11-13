@@ -1,12 +1,11 @@
 [package]
 name = "moasearch"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Rust와 Google 로컬 모델로 동작하는 개인 파일 검색"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
 cfb = "0.14"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3.4"
@@ -20,28 +19,25 @@ llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "955aa2
 quick-xml = "0.42"
 oar-ocr = { version = "=0.10.2", default-features = false, features = ["download-binaries", "simd"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std"] }
-rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 tao = "=0.37.2"
 wry = "=0.57.1"
-windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Graphics_Imaging", "Storage", "Storage_Streams", "Data_Pdf", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Pipes", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [build-dependencies]
 winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 
 [profile.release]
 lto = "thin"

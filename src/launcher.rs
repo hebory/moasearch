@@ -1,17 +1,20 @@
-//! Explorer handoff: reuse the matching local server, or start one without a console.
+//! Explorer handoff and per-data-folder desktop-instance reuse.
+
 use anyhow::{Context, Result, bail, ensure};
-use moasearch::{config, search::canonical_folder};
-use reqwest::{blocking::Client, redirect::Policy};
+use moasearch::{
+    config,
+    instance::{self, Reply, Request},
+    search::canonical_folder,
+};
 use serde_json::{Value, json};
 use std::{
     fs::OpenOptions,
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
-// A detached server must not keep the invoking process's redirected pipes alive.
-// Windows otherwise inherits them even though its own stdout/stderr use a log.
+// A detached app must not keep the Explorer caller's redirected pipes alive.
 #[cfg(windows)]
 struct StandardHandleInheritance(Vec<(windows::Win32::Foundation::HANDLE, u32)>);
 #[cfg(windows)]
@@ -53,201 +56,133 @@ impl Drop for StandardHandleInheritance {
     }
 }
 
-pub(crate) fn folder_url(port: u16, folder: &Path) -> Result<String> {
-    let path = folder
-        .to_str()
-        .context("폴더 경로를 UTF-8로 읽을 수 없습니다.")?;
-    let mut encoded = String::new();
-    for byte in path.as_bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
-            encoded.push(*byte as char);
-        } else {
-            use std::fmt::Write;
-            write!(encoded, "%{byte:02X}")?;
-        }
+pub fn open_window(data_dir: &Path, folder: Option<&Path>) -> Result<Value> {
+    let data_dir = config::canonical(data_dir)?;
+    let folder = folder.map(canonical_folder).transpose()?;
+    let existing = instance::request(&data_dir, &Request::Status)?;
+    let reused = existing.is_some();
+
+    if existing.is_none() {
+        let child = spawn_desktop(&data_dir, folder.as_deref())?;
+        wait_until_ready(&data_dir, Some(child))?;
+    } else if !existing.as_ref().unwrap().ready {
+        wait_until_ready(&data_dir, None)?;
     }
-    // Each app window keeps its own scope; fragments are not sent with HTTP requests.
-    Ok(format!("http://127.0.0.1:{port}/#folder={encoded}"))
-}
 
-struct Instance {
-    info: Value,
-    token: String,
-}
-
-fn client() -> Result<Client> {
-    Ok(Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .connect_timeout(Duration::from_millis(500))
-        .timeout(Duration::from_secs(2))
-        .build()?)
-}
-
-fn show_window(
-    client: &Client,
-    port: u16,
-    instance: &Instance,
-    folder: Option<&Path>,
-) -> Result<()> {
-    ensure!(
-        instance.info["desktop"] == true,
-        "같은 포트에서 창 없는 개발 서버가 실행 중입니다. 개발 서버를 종료한 뒤 모아검색을 실행하세요."
-    );
-    let response = client
-        .post(format!("http://127.0.0.1:{port}/api/window"))
-        .header("X-MoaSearch-Token", &instance.token)
-        .json(&json!({"folder":folder}))
-        .send()?;
-    ensure!(
-        response.status().is_success(),
-        "모아검색 창을 열지 못했습니다: {}",
-        response.text()?
-    );
-    Ok(())
-}
-
-pub fn focus_existing(data_dir: &Path, folder: Option<&Path>, port: u16) -> Result<bool> {
-    let client = client()?;
-    if let Some(instance) = probe(&client, port, data_dir)? {
-        show_window(&client, port, &instance, folder)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn probe(client: &Client, port: u16, data_dir: &Path) -> Result<Option<Instance>> {
-    let base = format!("http://127.0.0.1:{port}");
-    let page = match client.get(&base).send() {
-        Ok(response) => response,
-        Err(error) if error.is_connect() => return Ok(None),
-        Err(error) => return Err(error).context("실행 중인 앱에 연결할 수 없습니다."),
-    };
-    ensure!(
-        page.status().is_success(),
-        "포트 {port}를 다른 프로그램이 사용 중입니다."
-    );
-    let html = page.text()?;
-    let token = html
-        .split("name=\"moasearch-token\" content=\"")
-        .nth(1)
-        .and_then(|tail| tail.split('"').next())
-        .filter(|token| token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
-        .context("이 포트의 프로그램은 모아검색이 아닙니다. 실행 중인 앱을 확인하세요.")?;
-    let response = client
-        .get(format!("{base}/api/instance"))
-        .header("X-MoaSearch-Token", token)
-        .send()?;
-    ensure!(
-        response.status().is_success(),
-        "실행 중인 모아검색이 폴더 검색을 지원하지 않습니다. 이전 앱을 종료한 뒤 다시 실행하세요."
-    );
-    let instance: Value = response.json()?;
-    ensure!(
-        instance["app"] == "moasearch" && instance["folder_protocol"] == 1,
-        "실행 중인 앱과 폴더 검색 연결 규격이 다릅니다."
-    );
-    let running_data = instance["data_dir"]
-        .as_str()
-        .context("앱 데이터 위치를 확인하지 못했습니다.")?;
-    ensure!(
-        config::within(data_dir, Path::new(running_data))
-            && config::within(Path::new(running_data), data_dir),
-        "다른 데이터 위치를 사용하는 모아검색이 포트 {port}에서 실행 중입니다. 해당 앱을 종료하거나 같은 데이터 위치를 지정하세요."
-    );
-    Ok(Some(Instance {
-        info: instance,
-        token: token.to_owned(),
+    let reply = request_existing(
+        &data_dir,
+        Request::Open {
+            folder: folder.clone(),
+        },
+    )?;
+    Ok(json!({
+        "app":"moasearch",
+        "folder":folder,
+        "reused":reused,
+        "desktop":true,
+        "pid":reply.pid
     }))
 }
 
-pub fn open_folder(data_dir: &Path, path: &Path, port: u16, no_browser: bool) -> Result<Value> {
-    let folder = canonical_folder(path)?;
-    let url = folder_url(port, &folder)?;
-    let client = client()?;
-    let mut instance = probe(&client, port, data_dir)?;
-    let reused = instance.is_some();
-    if instance.is_none() {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(data_dir.join("server.log"))?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .arg("--data-dir")
-            .arg(data_dir)
-            .args([
-                if no_browser { "serve" } else { "desktop" },
-                "--port",
-                &port.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        if !no_browser {
-            command.arg("--folder").arg(&folder).arg("--background");
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        #[cfg(windows)]
-        let standard_handle_inheritance = StandardHandleInheritance::disable()?;
-        let mut child = command
-            .spawn()
-            .context("모아검색 서버를 시작하지 못했습니다.")?;
-        #[cfg(windows)]
-        drop(standard_handle_inheritance);
-        let started = (|| -> Result<Instance> {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Some(instance) = probe(&client, port, data_dir)? {
-                    if no_browser || instance.info["desktop"] == true {
-                        return Ok(instance);
-                    }
-                }
-                if let Some(status) = child.try_wait()? {
-                    // Another simultaneous Explorer invocation can have won the bind.
-                    if let Some(instance) = probe(&client, port, data_dir)? {
-                        if no_browser || instance.info["desktop"] == true {
-                            return Ok(instance);
-                        }
-                        // A simultaneous launch can still be constructing its first WebView.
-                        ensure!(
-                            Instant::now() < deadline,
-                            "모아검색 창 준비 시간이 초과되었습니다."
-                        );
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    bail!(
-                        "모아검색 서버가 종료되었습니다 ({status}). 데이터 폴더의 server.log를 확인하세요."
-                    );
-                }
+pub fn running_instance(data_dir: &Path) -> Result<Option<Value>> {
+    instance::request(data_dir, &Request::Status)?
+        .map(|reply| serde_json::to_value(reply).map_err(Into::into))
+        .transpose()
+}
+
+pub fn quit(data_dir: &Path) -> Result<Value> {
+    match instance::request(data_dir, &Request::Quit)? {
+        Some(reply) => Ok(serde_json::to_value(reply)?),
+        None => Ok(json!({"app":"moasearch","running":false,"accepted":false})),
+    }
+}
+
+fn request_existing(data_dir: &Path, request: Request) -> Result<Reply> {
+    let reply = instance::request(data_dir, &request)?;
+    let reply = reply.context("모아검색 앱이 실행 중이 아닙니다.")?;
+    ensure!(
+        reply.accepted,
+        "{}",
+        reply
+            .detail
+            .unwrap_or_else(|| "모아검색 요청을 처리하지 못했습니다.".into())
+    );
+    Ok(reply)
+}
+
+fn wait_until_ready(data_dir: &Path, child: Option<Child>) -> Result<Reply> {
+    let mut child = SpawnedChild(child);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if let Some(reply) = instance::request(data_dir, &Request::Status)? {
+            if reply.ready {
                 ensure!(
-                    Instant::now() < deadline,
-                    "모아검색 시작 시간이 초과되었습니다. 데이터 폴더의 server.log를 확인하세요."
+                    reply.accepted,
+                    "{}",
+                    reply
+                        .detail
+                        .unwrap_or_else(|| "앱 상태를 확인하지 못했습니다.".into())
                 );
-                std::thread::sleep(Duration::from_millis(100));
+                child.0.take(); // Dropping the child handle leaves the app running.
+                return Ok(reply);
             }
-        })();
-        match started {
-            Ok(value) => instance = Some(value),
-            Err(error) => {
+        } else if let Some(process) = child.0.as_mut() {
+            if let Some(status) = process.try_wait()? {
+                bail!(
+                    "모아검색 데스크톱 앱이 시작되지 않았습니다 ({status}). 데이터 폴더의 instance.log를 확인하세요."
+                );
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "모아검색 앱 준비 시간이 초과되었습니다."
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct SpawnedChild(Option<Child>);
+impl Drop for SpawnedChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(error);
             }
         }
     }
-    let instance = instance.unwrap();
-    if !no_browser {
-        show_window(&client, port, &instance, Some(&folder))?;
+}
+
+fn spawn_desktop(data_dir: &Path, folder: Option<&Path>) -> Result<Child> {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("instance.log"))
+        .context("앱 실행 로그 파일을 열지 못했습니다.")?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(["desktop", "--background", "--no-dialog"])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    if let Some(folder) = folder {
+        command.arg("--folder").arg(folder);
     }
-    Ok(
-        json!({"url":url,"folder":folder,"reused":reused,"desktop":instance.info["desktop"],"pid":instance.info["pid"]}),
-    )
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    #[cfg(windows)]
+    let standard_handle_inheritance = StandardHandleInheritance::disable()?;
+    let child = command
+        .spawn()
+        .context("모아검색 앱을 실행하지 못했습니다.")?;
+    #[cfg(windows)]
+    drop(standard_handle_inheritance);
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -255,21 +190,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explorer_url_round_trips_special_characters_without_query_injection() -> Result<()> {
-        for path in [
-            r"C:\",
-            r"C:\한글 폴더\100%_계약 + # &=",
-            r"\\server\share\문서",
-        ] {
-            let url = reqwest::Url::parse(&folder_url(18765, Path::new(path))?)?;
-            assert_eq!(url.query(), None);
-            let decoded =
-                reqwest::Url::parse(&format!("http://localhost/?{}", url.fragment().unwrap()))?;
-            let pairs: Vec<_> = decoded.query_pairs().collect();
-            assert_eq!(pairs.len(), 1);
-            assert_eq!(pairs[0].0, "folder");
-            assert_eq!(pairs[0].1, path);
-        }
+    fn desktop_folder_is_canonicalized_before_handoff() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let folder = temp.path().join("선택 %_ # & 폴더");
+        std::fs::create_dir_all(&folder)?;
+        assert_eq!(canonical_folder(&folder)?, config::canonical(&folder)?);
         Ok(())
     }
 }

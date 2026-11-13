@@ -58,11 +58,16 @@ pub fn verify_ocr_models(directory: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok(paths)
 }
 
-fn download_ocr_models(directory: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf> {
+fn download_ocr_models(
+    directory: &Path,
+    progress: &dyn Fn(u64, u64),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
     fs::create_dir_all(directory)?;
     let total = OCR_DET.bytes + OCR_REC.bytes;
     let mut completed = 0;
     for spec in [&OCR_DET, &OCR_REC] {
+        anyhow::ensure!(!cancelled(), "모델 다운로드를 취소했습니다.");
         let target = directory.join(spec.filename);
         if fs::symlink_metadata(&target).is_ok() {
             let metadata = fs::symlink_metadata(&target)?;
@@ -78,7 +83,8 @@ fn download_ocr_models(directory: &Path, progress: &dyn Fn(u64, u64)) -> Result<
             }
         } else {
             let client = Client::builder()
-                .timeout(std::time::Duration::from_secs(180))
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()?;
             let mut response = client.get(spec.url).send()?.error_for_status()?;
             let temporary =
@@ -93,6 +99,7 @@ fn download_ocr_models(directory: &Path, progress: &dyn Fn(u64, u64)) -> Result<
             let mut received = 0;
             let mut buffer = vec![0u8; 1024 * 1024];
             loop {
+                anyhow::ensure!(!cancelled(), "모델 다운로드를 취소했습니다.");
                 let n = response.read(&mut buffer)?;
                 if n == 0 {
                     break;
@@ -225,9 +232,21 @@ pub fn download_model(
     directory: &Path,
     progress: &dyn Fn(u64, u64),
 ) -> Result<PathBuf> {
+    download_model_cancellable(kind, directory, progress, &|| false)
+}
+
+/// Download the same pinned models as `download_model`, checking cancellation
+/// between reads and using bounded network waits so shutdown can join promptly.
+pub fn download_model_cancellable(
+    kind: &str,
+    directory: &Path,
+    progress: &dyn Fn(u64, u64),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
     if kind == "ocr" {
-        return download_ocr_models(directory, progress);
+        return download_ocr_models(directory, progress, cancelled);
     }
+    anyhow::ensure!(!cancelled(), "모델 다운로드를 취소했습니다.");
     let kind = ModelKind::from_str(kind)?;
     fs::create_dir_all(directory)
         .with_context(|| format!("모델 폴더를 만들 수 없습니다: {}", directory.display()))?;
@@ -246,7 +265,8 @@ pub fn download_model(
     );
     let client = Client::builder()
         .user_agent(concat!("MoaSearch/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15))
         .build()?;
     let mut response = client.get(url).send()?.error_for_status()?;
     if response
@@ -270,6 +290,7 @@ pub fn download_model(
     let mut received = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
+        anyhow::ensure!(!cancelled(), "모델 다운로드를 취소했습니다.");
         let count = response.read(&mut buffer)?;
         if count == 0 {
             break;

@@ -1,321 +1,255 @@
-//! Native Windows windows that render the local MoaSearch UI in WebView2.
+//! Windows host: bundled screen, in-process commands, and native window lifetime.
+mod assets;
+mod bridge;
+mod worker;
 
-use anyhow::Result;
-use std::{path::PathBuf, sync::Arc};
+use anyhow::{Context, Result, anyhow, ensure};
+use moasearch::{
+    commands::Command,
+    engine::EmbeddedEngine,
+    instance::{Instance, InstanceCommand, InstanceHandler},
+    search::{canonical_folder, folder_contains_path},
+    service::AppServices,
+    store::Store,
+};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tao::{
+    dpi::LogicalSize,
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
+    platform::run_return::EventLoopExtRunReturn,
+    window::{Icon, Window, WindowBuilder, WindowId},
+};
+use wry::{
+    NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder,
+    WebViewBuilderExtWindows,
+};
 
-use moasearch::{engine::EmbeddedEngine, store::Store};
+enum DesktopEvent {
+    Open(Option<PathBuf>),
+    Invoke(WindowId, bridge::Request),
+    Response(WindowId, bridge::Response, bool),
+    Quit,
+}
+struct AppWindow {
+    // Drop the WebView before its native parent window.
+    webview: WebView,
+    window: Window,
+    folder: Option<PathBuf>,
+}
 
-#[cfg(windows)]
-mod windows_desktop {
-    use super::{EmbeddedEngine, PathBuf, Result, Store};
-    use crate::launcher::folder_url;
-    use anyhow::{Context, anyhow};
-    use moasearch::{
-        app::{self, AppState},
-        search::{canonical_folder, folder_contains_path},
-    };
-    use std::sync::Arc;
-    use std::{
-        collections::HashMap,
-        net::Ipv4Addr,
-        path::Path,
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-    use tao::{
-        dpi::LogicalSize,
-        event::{Event, WindowEvent},
-        event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
-        platform::run_return::EventLoopExtRunReturn,
-        window::{Icon, Window, WindowBuilder, WindowId},
-    };
-    use tokio::{net::TcpListener, runtime::Runtime};
-    use wry::{
-        NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder,
-        WebViewBuilderExtWindows,
-    };
+pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBuf>) -> Result<()> {
+    let folder = folder.map(|path| canonical_folder(&path)).transpose()?;
+    let mut event_loop = EventLoopBuilder::<DesktopEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let closing = Arc::new(AtomicBool::new(false));
+    let gate = closing.clone();
+    let handoff_proxy = proxy.clone();
+    let handler: InstanceHandler = Arc::new(move |command| {
+        ensure!(
+            !gate.load(Ordering::Acquire),
+            "모아검색이 종료 중입니다. 잠시 후 다시 실행하세요."
+        );
+        handoff_proxy
+            .send_event(match command {
+                InstanceCommand::Open(folder) => DesktopEvent::Open(folder),
+                InstanceCommand::Quit => DesktopEvent::Quit,
+            })
+            .map_err(|_| anyhow!("모아검색 창이 이미 종료되었습니다."))
+    });
+    // Claim the data directory before opening its WebView profile or starting work.
+    let instance = Instance::bind(&store.data_dir, handler)?;
+    let services = AppServices::new(store.clone(), engine);
+    let workers = worker::Workers::new(4, 64);
+    let mut context = WebContext::new(Some(store.data_dir.join("webview2")));
+    let first = create_window(&event_loop, &mut context, folder, proxy.clone())?;
+    let mut windows = HashMap::from([(first.window.id(), first)]);
+    services.indexer.start_scheduler();
+    let mut failure = None;
 
-    enum UserEvent {
-        Open(Option<PathBuf>),
-        ServerStopped,
-    }
-
-    struct DesktopWindow {
-        window: Window,
-        _webview: WebView,
-        folder: Option<PathBuf>,
-    }
-
-    pub(super) fn run(
-        store: Arc<Store>,
-        engine: Arc<EmbeddedEngine>,
-        folder: Option<PathBuf>,
-        port: u16,
-    ) -> Result<()> {
-        anyhow::ensure!(port >= 1024, "포트는 1024 이상이어야 합니다.");
-        let folder = folder.map(|path| canonical_folder(&path)).transpose()?;
-
-        let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-        let proxy = event_loop.create_proxy();
-        let state = AppState::new(store.clone(), engine);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("로컬 앱 서버를 초기화하지 못했습니다.")?;
-        let listener = runtime
-            .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
-            .with_context(|| format!("로컬 앱 서버 포트 {port}를 열지 못했습니다."))?;
-
-        state.indexer.start_scheduler();
-        let server = start_server(runtime, listener, state.clone(), proxy.clone());
-
-        let mut web_context = WebContext::new(Some(store.data_dir.join("webview2")));
-        let mut windows = HashMap::<WindowId, DesktopWindow>::new();
-        match create_window(&event_loop, &mut web_context, port, folder.clone()) {
-            Ok(window) => {
-                windows.insert(window.window.id(), window);
-            }
-            Err(error) => {
-                stop_server(&state, server)?;
-                return Err(error);
-            }
-        }
-
-        let event_proxy = proxy.clone();
-        state.set_desktop_handler(Arc::new(move |folder| {
-            event_proxy
-                .send_event(UserEvent::Open(folder))
-                .map_err(|_| anyhow!("모아검색 데스크톱 창이 이미 종료되었습니다."))
-        }));
-
-        let mut loop_error = None;
-        event_loop.run_return(|event, target, control_flow| {
-            *control_flow = ControlFlow::Wait;
-            match event {
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    window_id,
-                    ..
-                } => {
-                    windows.remove(&window_id);
-                    if windows.is_empty() {
-                        state.indexer.close();
-                        state.shutdown.notify_one();
-                        *control_flow = ControlFlow::Exit;
-                    }
-                }
-                Event::UserEvent(UserEvent::Open(folder)) => {
-                    match folder.map(|path| canonical_folder(&path)).transpose() {
-                        Err(error) => {
-                            eprintln!("요청한 폴더를 열 수 없습니다: {error:#}");
-                            focus_window(&windows, None);
-                        }
-                        Ok(folder) => {
-                            let focused = if let Some(folder) = folder.as_deref() {
-                                focus_matching_folder(&mut windows, folder, port).unwrap_or_else(
-                                    |error| {
-                                        loop_error = Some(error);
-                                        false
-                                    },
-                                )
-                            } else {
-                                focus_window(&windows, None)
-                            };
-                            if loop_error.is_some() {
-                                state.indexer.close();
-                                state.shutdown.notify_one();
-                                for (_, window) in windows.drain() {
-                                    window.window.set_visible(false);
-                                }
-                                *control_flow = ControlFlow::Exit;
-                            } else if !focused {
-                                match create_window(target, &mut web_context, port, folder) {
-                                    Ok(window) => {
-                                        windows.insert(window.window.id(), window);
-                                    }
-                                    Err(error) => {
-                                        loop_error = Some(error);
-                                        state.indexer.close();
-                                        state.shutdown.notify_one();
-                                        for (_, window) in windows.drain() {
-                                            window.window.set_visible(false);
-                                        }
-                                        *control_flow = ControlFlow::Exit;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Event::UserEvent(UserEvent::ServerStopped) => {
-                    for (_, window) in windows.drain() {
-                        window.window.set_visible(false);
-                    }
+    event_loop.run_return(|event, target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } => {
+                windows.remove(&window_id);
+                if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
                 }
-                _ => {}
             }
-        });
-
-        windows.clear();
-        state.indexer.close();
-        state.shutdown.notify_one();
-        let server_result = server
-            .join()
-            .map_err(|_| anyhow!("로컬 앱 서버 thread가 비정상 종료되었습니다."))?;
-        server_result?;
-        if let Some(error) = loop_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn start_server(
-        runtime: Runtime,
-        listener: TcpListener,
-        state: Arc<AppState>,
-        proxy: EventLoopProxy<UserEvent>,
-    ) -> JoinHandle<Result<()>> {
-        thread::spawn(move || {
-            let shutdown_state = state.clone();
-            let result = runtime.block_on(async move {
-                axum::serve(listener, app::router(state))
-                    .with_graceful_shutdown(async move {
-                        shutdown_state.shutdown.notified().await;
-                        shutdown_state.indexer.close();
-                        while shutdown_state.indexer.status()["running"] == true {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+            Event::UserEvent(DesktopEvent::Quit) => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(DesktopEvent::Open(folder)) => {
+                let result = (|| -> Result<()> {
+                    let folder = folder.map(|path| canonical_folder(&path)).transpose()?;
+                    let found = windows
+                        .values_mut()
+                        .find(|entry| same_folder(entry.folder.as_deref(), folder.as_deref()));
+                    if let Some(entry) = found {
+                        // Restore the selected folder if the user previously cleared its scope.
+                        if folder.is_some() {
+                            entry
+                                .webview
+                                .load_url(&assets::window_url(folder.as_deref())?)?;
                         }
-                    })
-                    .await
-                    .context("로컬 앱 서버가 종료되었습니다.")
-            });
-            let _ = proxy.send_event(UserEvent::ServerStopped);
-            result
-        })
-    }
-
-    fn stop_server(state: &Arc<AppState>, server: JoinHandle<Result<()>>) -> Result<()> {
-        state.indexer.close();
-        state.shutdown.notify_one();
-        server
-            .join()
-            .map_err(|_| anyhow!("로컬 앱 서버 thread가 비정상 종료되었습니다."))??;
-        Ok(())
-    }
-
-    fn focus_window(windows: &HashMap<WindowId, DesktopWindow>, folder: Option<&Path>) -> bool {
-        let found = windows
-            .values()
-            .find(|entry| same_folder(entry.folder.as_deref(), folder))
-            .or_else(|| {
-                folder.is_none().then(|| {
-                    windows
-                        .values()
-                        .find(|entry| entry.folder.is_none())
-                        .or_else(|| windows.values().next())
-                })?
-            });
-        let Some(entry) = found else { return false };
-        entry.window.set_visible(true);
-        entry.window.set_minimized(false);
-        entry.window.set_focus();
-        true
-    }
-
-    fn focus_matching_folder(
-        windows: &mut HashMap<WindowId, DesktopWindow>,
-        folder: &Path,
-        port: u16,
-    ) -> Result<bool> {
-        let Some(entry) = windows
-            .values_mut()
-            .find(|entry| same_folder(entry.folder.as_deref(), Some(folder)))
-        else {
-            return Ok(false);
-        };
-        entry._webview.load_url(&folder_url(port, folder)?)?;
-        entry.window.set_visible(true);
-        entry.window.set_minimized(false);
-        entry.window.set_focus();
-        Ok(true)
-    }
-
-    fn same_folder(left: Option<&Path>, right: Option<&Path>) -> bool {
-        match (left, right) {
-            (None, None) => true,
-            (Some(left), Some(right)) => {
-                folder_contains_path(left, right) && folder_contains_path(right, left)
+                        focus(&entry.window);
+                    } else if folder.is_none() && !windows.is_empty() {
+                        focus(&windows.values().next().unwrap().window);
+                    } else {
+                        let entry = create_window(target, &mut context, folder, proxy.clone())?;
+                        windows.insert(entry.window.id(), entry);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    failure = Some(error);
+                    *control_flow = ControlFlow::Exit;
+                }
             }
-            _ => false,
+            Event::UserEvent(DesktopEvent::Invoke(id, request)) => {
+                let Some(window) = windows.get(&id) else {
+                    return;
+                };
+                let command = match request.command() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        send_response(&window.webview, request.response(Err(error)));
+                        return;
+                    }
+                };
+                if matches!(command, Command::Quit {}) {
+                    send_response(
+                        &window.webview,
+                        request.response(Ok(serde_json::json!({"ok":true}))),
+                    );
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                let boot = matches!(command, Command::Status {});
+                let request = Arc::new(request);
+                let background_request = request.clone();
+                let services = services.clone();
+                let responder = proxy.clone();
+                let submitted = workers.submit(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        services.execute(command)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow!("앱 작업 처리 중 오류가 발생했습니다.")));
+                    let ready = boot && result.is_ok();
+                    let _ = responder.send_event(DesktopEvent::Response(
+                        id,
+                        background_request.response(result),
+                        ready,
+                    ));
+                });
+                if let Err(error) = submitted {
+                    send_response(&window.webview, request.response(Err(error)));
+                }
+            }
+            Event::UserEvent(DesktopEvent::Response(id, response, ready)) => {
+                if let Some(window) = windows.get(&id) {
+                    if let Ok(script) = response.script() {
+                        if window.webview.evaluate_script(&script).is_ok() && ready {
+                            // The bundled UI has invoked Rust and received its first status.
+                            instance.mark_ready();
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
+    });
+
+    closing.store(true, Ordering::Release);
+    windows.clear();
+    services.begin_shutdown();
+    drop(workers);
+    services.wait_shutdown()?;
+    drop(instance);
+    if let Some(error) = failure {
+        return Err(error);
     }
+    Ok(())
+}
 
-    fn create_window(
-        target: &EventLoopWindowTarget<UserEvent>,
-        context: &mut WebContext,
-        port: u16,
-        folder: Option<PathBuf>,
-    ) -> Result<DesktopWindow> {
-        let base_url = format!("http://127.0.0.1:{port}");
-        let url = match folder.as_deref() {
-            Some(folder) => folder_url(port, folder)?,
-            None => base_url.clone(),
-        };
-        let icon = app_icon()?;
-        let window = WindowBuilder::new()
-            .with_title("모아검색")
-            .with_inner_size(LogicalSize::new(1180.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(900.0, 650.0))
-            .with_window_icon(Some(icon))
-            .build(target)
-            .context("모아검색 데스크톱 창을 만들지 못했습니다.")?;
-
-        let expected_origin = reqwest::Url::parse(&base_url)?;
-        let builder = WebViewBuilder::new_with_web_context(context)
-            .with_url(&url)
-            .with_devtools(false)
-            .with_navigation_handler(move |requested| is_app_origin(&expected_origin, &requested))
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_download_started_handler(|_, _| false)
-            .with_permission_handler(|_| PermissionResponse::Deny)
-            .with_default_context_menus(false);
-        let webview = builder.build(&window).map_err(|error| {
-            anyhow!("WebView2 Runtime을 시작하지 못했습니다. Microsoft Edge WebView2 Runtime을 설치하거나 복구한 뒤 다시 실행하세요: {error}")
-        })?;
-
-        Ok(DesktopWindow {
-            window,
-            _webview: webview,
-            folder,
-        })
+fn send_response(webview: &WebView, response: bridge::Response) {
+    if let Ok(script) = response.script() {
+        let _ = webview.evaluate_script(&script);
     }
-
-    fn is_app_origin(expected: &reqwest::Url, requested: &str) -> bool {
-        let Ok(requested) = reqwest::Url::parse(requested) else {
-            return false;
-        };
-        requested.scheme() == expected.scheme()
-            && requested.host_str() == expected.host_str()
-            && requested.port_or_known_default() == expected.port_or_known_default()
-            && requested.username().is_empty()
-            && requested.password().is_none()
-    }
-
-    fn app_icon() -> Result<Icon> {
-        let image = image::load_from_memory(include_bytes!("../icon.png"))?.into_rgba8();
-        let (width, height) = image.dimensions();
-        Icon::from_rgba(image.into_raw(), width, height)
-            .map_err(|error| anyhow!("모아검색 창 아이콘을 읽지 못했습니다: {error}"))
+}
+fn focus(window: &Window) {
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.set_focus();
+}
+fn same_folder(left: Option<&Path>, right: Option<&Path>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            folder_contains_path(left, right) && folder_contains_path(right, left)
+        }
+        _ => false,
     }
 }
 
-#[cfg(windows)]
-pub fn run(
-    store: Arc<Store>,
-    engine: Arc<EmbeddedEngine>,
+fn create_window(
+    target: &EventLoopWindowTarget<DesktopEvent>,
+    context: &mut WebContext,
     folder: Option<PathBuf>,
-    port: u16,
-) -> Result<()> {
-    windows_desktop::run(store, engine, folder, port)
+    proxy: EventLoopProxy<DesktopEvent>,
+) -> Result<AppWindow> {
+    let image = image::load_from_memory(include_bytes!("../icon.png"))?.into_rgba8();
+    let (width, height) = image.dimensions();
+    let icon = Icon::from_rgba(image.into_raw(), width, height)?;
+    let window = WindowBuilder::new()
+        .with_title("모아검색")
+        .with_inner_size(LogicalSize::new(1180.0, 800.0))
+        .with_min_inner_size(LogicalSize::new(900.0, 650.0))
+        .with_window_icon(Some(icon))
+        .build(target)
+        .context("모아검색 창을 만들지 못했습니다.")?;
+    let id = window.id();
+    let webview = WebViewBuilder::new_with_web_context(context)
+        .with_https_scheme(true)
+        .with_custom_protocol(assets::SCHEME.into(), |_, request| {
+            let asset = if request.method() == wry::http::Method::GET && assets::is_app_url(&request.uri().to_string()) {
+                assets::resource(request.uri().path())
+            } else { None };
+            let (status, mime, body) = match asset {
+                Some((mime, body)) => (200, mime, body),
+                None => (404, "text/plain; charset=utf-8", b"Not found".as_slice()),
+            };
+            wry::http::Response::builder().status(status)
+                .header("Content-Type", mime).header("Content-Security-Policy", assets::CSP)
+                .header("X-Content-Type-Options", "nosniff").header("Cache-Control", "no-store")
+                .body(Cow::Borrowed(body)).unwrap()
+        })
+        .with_url(assets::window_url(folder.as_deref())?)
+        .with_ipc_handler(move |request| {
+            if !assets::is_document(&request.uri().to_string()) { return; }
+            if let Ok(request) = bridge::Request::parse(request.body()) {
+                let _ = proxy.send_event(DesktopEvent::Invoke(id, request));
+            }
+        })
+        .with_navigation_handler(|url| assets::is_document(&url))
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_download_started_handler(|_, _| false)
+        .with_permission_handler(|_| PermissionResponse::Deny)
+        .with_default_context_menus(false).with_devtools(false)
+        .build(&window).context("WebView2 화면을 시작하지 못했습니다. Microsoft WebView2 Runtime을 설치하거나 복구하세요.")?;
+    Ok(AppWindow {
+        webview,
+        window,
+        folder,
+    })
 }
