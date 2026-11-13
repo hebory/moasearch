@@ -36,6 +36,7 @@ UninstallDisplayIcon={app}\moasearch.exe
 CloseApplications=yes
 CloseApplicationsFilter=moasearch.exe
 RestartApplications=no
+ChangesAssociations=yes
 WizardStyle=modern
 Compression=lzma2/normal
 SolidCompression=yes
@@ -64,7 +65,8 @@ Root: HKCU; Subkey: "Software\Classes\Directory\shell\MoaSearch.SearchFolder\com
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\MoaSearch.SearchFolder"; ValueType: none; Tasks: not explorercontext; Flags: deletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground"; ValueType: string; ValueName: ""; ValueData: "모아검색으로 여기서 검색"; Tasks: explorercontext; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\moasearch.exe,0"; Tasks: explorercontext
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Single"; Tasks: explorercontext
+; A background menu has no selected item. Remove the old Single restriction on upgrade.
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground"; ValueType: none; ValueName: "MultiSelectModel"; Tasks: explorercontext; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground\command"; ValueType: string; ValueName: ""; ValueData: """{app}\moasearch.exe"" open-folder --path ""%V\."""; Tasks: explorercontext; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.SearchBackground"; ValueType: none; Tasks: not explorercontext; Flags: deletekey
 

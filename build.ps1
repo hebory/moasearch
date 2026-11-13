@@ -88,7 +88,7 @@ if ($Test) {
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
         throw '화면 IPC 검증에는 Node.js 18 이상이 필요합니다.'
     }
-    node --test tests/frontend_bridge.test.cjs
+    node --test tests/frontend_bridge.test.cjs tests/frontend_app.test.cjs
     if ($LASTEXITCODE -ne 0) { throw '화면 IPC 검증에 실패했습니다.' }
     $env:PATH = "$(Join-Path $PSScriptRoot 'target\release');$env:PATH"
     cargo test --release --locked
