@@ -11,7 +11,7 @@
 ```powershell
 $licenses = .\packaging\collect-licenses.ps1 | ConvertFrom-Json
 .\packaging\release.ps1 `
-  -Version 0.4.0 `
+  -Version 0.4.1 `
   -SkipBuild `
   -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
   -CrtDirectory "$env:SystemRoot\System32" `
@@ -22,9 +22,9 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 `dist\artifacts\`에 다음 공개 파일이 생성됩니다.
 
-- `moasearch-0.4.0-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
-- `moasearch-0.4.0-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
-- `moasearch-0.4.0-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
+- `moasearch-0.4.1-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
+- `moasearch-0.4.1-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
+- `moasearch-0.4.1-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
 - `SHA256SUMS.txt`: 설치기·ZIP·배포 명세·아이콘·커버·카탈로그 총 6개 파일의 SHA-256 (체크섬 파일 자신은 제외)
 - `icon.png`, `cover.png`: Moa Launcher 앱 아이콘과 커버
 - `moalauncher.json`: Moa Launcher 카탈로그 등록 메타데이터
@@ -39,13 +39,13 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 설치기는 Windows 10/11 x64에서 `{localappdata}\Programs\moasearch` 아래에 현재 사용자 권한으로 설치합니다. 로컬 AI 기능은 AVX2를 지원하는 x64 CPU가 필요합니다. 관리자 권한을 요구하지 않습니다. `/SILENT /DIR="<경로>" /NORESTART` 옵션을 지원하며, 자동 설치에서는 앱을 시작하지 않습니다. 대화형 설치에서는 완료 화면의 실행 선택 항목을 제공합니다.
 
-직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.4.0에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.4.0은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
+직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.4.1에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.4.1은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
 
 **탐색기에서 현재 폴더 검색** 옵션은 현재 사용자 `HKCU\Software\Classes` 아래의 `Directory\shell\MoaSearch.SearchFolder`와 `Directory\Background\shell\MoaSearch.SearchBackground`를 등록합니다. 옵션 해제 업데이트와 설치 제거 시 이 두 앱 전용 키를 정리합니다. 폴더와 빈 공간의 명령은 각각 `%1`, `%V` 경로를 `open-folder --path`에 전달하며, 드라이브 루트의 끝 역슬래시가 인용부호와 충돌하지 않도록 `\.`을 붙입니다. Windows 11에서는 **추가 옵션 표시**에 나타날 수 있습니다. 등록 형식은 [Microsoft Shell 문서](https://learn.microsoft.com/windows/win32/shell/reg-shell-exts), 설치·제거 조건은 [Inno Setup Registry 문서](https://jrsoftware.org/ishelp/topic_registrysection.htm)를 따릅니다.
 
 ## Moa Launcher 카탈로그
 
-Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.4.0`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.4.0-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.4.0-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
+Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.4.1`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.4.1-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.4.1-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
 
 Moa Launcher는 앱의 루트에서 공개 `icon.png`와 `cover.png`를 표시합니다. 이 이미지를 저장소 기본 브랜치에 게시하고 카탈로그의 앱 항목에서 해당 GitHub 이미지 주소를 참조하세요. `assets\branding\moasearch.ico`는 Windows 설치기의 아이콘이고, 모아 런처 상세 화면의 PNG 아이콘과 커버를 대체하지 않습니다.
 
@@ -107,3 +107,19 @@ Microsoft Visual C++ Runtime은 배포 가능 구성요소와 계약에 따라 �
 - 탐색기 메뉴 키는 설치 후 2개, 옵션 해제 후 0개, 재활성화 후 2개, 제거 후 0개였습니다. 제거 후 모델·색인 DB와 데이터 보존 확인 파일이 유지됐습니다.
 
 새 라이선스 수집은 Windows 일반·빌드 의존성 412개를 포함합니다. 원문이 없는 기존 `simd_helpers 0.1.0` 경고 1개는 고지에 유지했습니다. 앱과 설치기는 코드 서명하지 않았습니다. WebView2가 이미 설치된 이 PC에서 검증했으며, 깨끗한 Windows VM, WebView2 미설치 분기와 화면 직접 조작 검증은 포함하지 않았습니다.
+
+## v0.4.1 실제 설치·화면 검증
+
+2026-11-14 실제 사용자 설치 경로의 앱을 업데이트하고 `computer-use`로 창과 탐색기를 직접 조작했습니다. 이전 검증에서 다루지 못했던 화면 입력과 실제 우클릭 메뉴를 확인했습니다.
+
+- AI 설정 창에서 로컬 Google 임베딩 모델 경로를 입력하고 저장했습니다. 화면에서 한글·공백·특수문자가 있는 테스트 폴더를 추가하고 색인을 시작해 파일 8개·본문 구간 9개·벡터 9개를 확인했습니다.
+- 자연어 질의 `출장 교통비를 청구할 지출 내역`은 `receipt.png`, `서비스 배포가 실패하면 이전 버전으로 복구하는 방법`은 `meeting.pdf`를 첫 결과로 표시했습니다. 오른쪽 미리보기에서 이미지 OCR·페이지 OCR 내용도 확인했습니다.
+- 키워드 모드에서 `청록-9281`은 HWPX, `오로라-3147`은 HWP 본문을 찾았습니다. 결과의 **폴더에서 보기** 버튼이 탐색기에서 해당 문서를 선택했습니다.
+- 빈 공간 메뉴가 실제 탐색기에 보이지 않는 문제를 재현했습니다. `MultiSelectModel=Single` 때문에 선택한 항목이 없는 배경 메뉴가 숨겨졌습니다. 배경 메뉴의 해당 값을 삭제하고 폴더 메뉴의 단일 선택 조건은 유지했습니다. 새 설치기는 업데이트할 때 기존의 잘못된 값도 삭제합니다. 선택 수와 메뉴 표시 조건은 [Microsoft 문서](https://learn.microsoft.com/windows/win32/shell/how-to-employ-the-verb-selection-model), 설치·제거 후 탐색기 갱신은 [Inno Setup ChangesAssociations](https://jrsoftware.org/inno-setup/documentation/topic_setup_changesassociations.htm)를 따릅니다.
+- 실제 v0.4.1 설치 후 폴더 우클릭과 빈 공간 우클릭에서 **모아검색으로 여기서 검색**을 각각 실행했습니다. 같은 폴더 창이 재사용되고 선택 폴더·하위 폴더의 결과는 2개, 범위 해제 후 형제 폴더를 포함한 결과는 3개였습니다. 수정 버전에서도 폴더 범위 결과 2개를 다시 확인했습니다.
+- 검색어 변경 직후 이전 검색어로 질문할 수 있는 문제는 실제 `app.js`를 실행하는 회귀 테스트로 재현했습니다. 이전 버전에서 새 테스트 2개가 모두 실패하고, 수정 후 화면·IPC 테스트 11개가 모두 통과했습니다. 검색 대기·진행 중에는 질문을 막고 최신 검색 완료 후 활성화합니다.
+- 실제 설치를 v0.4.0에서 v0.4.1로 업데이트해 이전 배경 메뉴 제한 값의 자동 삭제, 색인과 모델 설정 보존을 확인했습니다. 설치된 761개 파일의 SHA-256이 배포 명세와 일치했습니다. ZIP의 나머지 1개는 설치 임시 파일로만 쓰는 WebView2 Bootstrapper입니다.
+- 최종 설치 앱에서도 이미지·스캔 PDF 자연어 질의의 첫 결과를 다시 확인했습니다. 화면의 앱 종료 확인에서 취소와 종료를 각각 조작하고 모든 모아검색 창·프로세스가 종료됨을 확인했습니다.
+- v0.4.1 네이티브 회귀 검증은 동시 실행·데이터 위치별 격리·폴더 범위·정상 종료를 통과했고 TCP 리스너는 0개였습니다. 설치 EXE는 13,328,475바이트, ZIP은 17,688,754바이트입니다.
+
+테스트 문서와 검증된 로컬 모델을 사용했습니다. 답변 모델의 생성 품질, 깨끗한 Windows VM과 WebView2 미설치 분기는 이번 화면 검증에 포함하지 않았습니다. 원본 문서를 변경하지 않았으며 앱과 설치기는 코드 서명하지 않았습니다.

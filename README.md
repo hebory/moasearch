@@ -119,7 +119,7 @@ Windows GUI 실행 파일이므로 PowerShell에서 명령 완료와 출력을 �
 ```powershell
 .\build.ps1 -Test
 cargo fmt --check
-node --test tests/frontend_bridge.test.cjs
+node --test tests/frontend_bridge.test.cjs tests/frontend_app.test.cjs
 .\scripts\test-explorer-launch.ps1
 .\build.ps1 -PrepareOnly
 cargo run --release --example benchmark -- --files 5000
