@@ -1,6 +1,6 @@
 [package]
 name = "moasearch"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Rust와 Google 로컬 모델로 동작하는 개인 파일 검색"
 

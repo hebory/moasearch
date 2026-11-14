@@ -85,11 +85,16 @@ function createApp() {
     'embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb',
   ].map(key => [key, new Element('input')]));
   const documentListeners = new Map();
+  const modeButtons = ['hybrid', 'keyword'].map(mode => {
+    const button = new Element('button');
+    button.dataset.mode = mode;
+    return button;
+  });
   const document = {
     activeElement: null,
     getElementById: id => elements.get(id) || null,
     createElement: tag => new Element(tag),
-    querySelectorAll: () => [],
+    querySelectorAll: selector => selector === '.mode-button' ? modeButtons : [],
     addEventListener(name, handler) { documentListeners.set(name, handler); },
   };
   const timers = new Map();
@@ -137,11 +142,15 @@ function createApp() {
       index: { running: false }, engine: {}, settings: {}, ocr: {}, model_download: {},
     });
   }
-  return { elements, calls, call, runTimer, resolveStatus };
+  return { elements, calls, call, runTimer, resolveStatus, document, modeButtons };
 }
 
 function searchResult(id, name) {
   return { id, name, path: `C:\\docs\\${name}`, extension: 'txt', size: 12, modified: '', snippet: '내용' };
+}
+
+function textTree(node) {
+  return [node.textContent || '', ...(node.children || []).map(textTree)].join(' ');
 }
 
 test('disables stale questions immediately and only enables them after the latest search', async () => {
@@ -169,6 +178,10 @@ test('disables stale questions immediately and only enables them after the lates
   query.dispatch('input');
   assert.equal(question.disabled, true, 'editing the query disables questions before debounce');
   assert.equal(answer.hidden, true, 'editing the query hides an answer for the previous query');
+  assert.equal(app.elements.get('results-title').textContent, '검색 대기 중…');
+  assert.equal(app.elements.get('results-list').children.length, 1, 'the previous result cards are cleared immediately');
+  assert.match(textTree(app.elements.get('results-list')), /검색어 입력이 끝나면 검색합니다/);
+  assert.match(textTree(app.elements.get('preview')), /파일을 선택해 주세요/, 'the previous file preview is cleared immediately');
   question.dispatch('click');
   assert.equal(app.call('answer').length, 1, 'a stale question cannot be submitted during debounce');
 
@@ -203,6 +216,42 @@ test('disables stale questions immediately and only enables them after the lates
   assert.equal(question.disabled, false, 'a late stale response cannot disable the latest completed search');
   question.dispatch('click');
   assert.equal(app.call('answer').at(-1).args.query, '다섯 번째 검색');
+});
+
+test('explains hybrid versus keyword search and preserves each match signal in result labels', async () => {
+  const app = createApp();
+  const hint = app.elements.get('search-hint');
+  assert.match(hint.textContent, /의미 유사 검색은 입력한 단어가 없는 문서도 찾을 수/);
+  app.modeButtons[1].dispatch('click');
+  assert.match(hint.textContent, /파일명·경로와 본문에서 찾습니다/);
+
+  app.resolveStatus();
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  query.value = '표시 신호';
+  app.elements.get('search-form').dispatch('submit');
+  const request = app.call('search')[0];
+  assert.equal(request.args.mode, 'keyword');
+  request.resolve({ intent: 'source_code', results: [
+    { ...searchResult(1, 'filename.txt'), match_type: 'filename' },
+    { ...searchResult(2, 'body.txt'), match_type: 'keyword' },
+    { ...searchResult(3, 'semantic.txt'), match_type: 'semantic' },
+    { ...searchResult(4, 'combined.txt'), match_type: 'filename+keyword+semantic' },
+    { ...searchResult(5, 'source.rs'), match_type: 'filetype+filename' },
+  ] });
+  await flushAsyncWork();
+  const cards = app.elements.get('results-list').children.filter(child => child.className.includes('result-card'));
+  assert.equal(cards.length, 5);
+  assert.match(textTree(cards[0]), /파일명·경로/);
+  assert.match(textTree(cards[1]), /본문 키워드/);
+  assert.match(textTree(cards[2]), /의미 유사/);
+  assert.match(textTree(cards[3]), /파일명·경로 \+ 본문 키워드 \+ 의미 유사/);
+  assert.match(textTree(cards[4]), /소스코드 파일 \+ 파일명·경로/);
+  assert.equal(hint.textContent, '소스코드 파일과 검색어가 포함된 문서를 찾습니다.');
+
+  query.value = '일반 검색';
+  query.dispatch('input');
+  assert.match(hint.textContent, /파일명·경로와 본문에서 찾습니다/);
 });
 
 test('answer request rechecks the live input against the completed search query', async () => {

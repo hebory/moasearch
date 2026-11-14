@@ -1,4 +1,5 @@
 //! Keyword and exact semantic search over the transactional SQLite index.
+mod intent;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -15,6 +16,10 @@ use crate::store::{Store, decode_vector};
 
 const DEFAULT_VECTOR_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const QUERY_CACHE_SIZE: usize = 64;
+// Conservative defaults evaluated with the pinned EmbeddingGemma 2 Q8_0.
+// Cosine is a model-specific ranking signal, not a probability of relevance.
+const MIN_SEMANTIC_SIMILARITY: f32 = 0.70;
+const MAX_SEMANTIC_DISTANCE_FROM_BEST: f32 = 0.05;
 
 #[derive(Debug)]
 struct VectorRow {
@@ -358,7 +363,36 @@ impl Search {
         let limit = limit.clamp(1, 100);
         let folder = folder.map(canonical_folder).transpose()?;
         let folder = folder.as_deref();
+        let source_code_intent = mode == "hybrid" && intent::is_source_code_query(query);
         let terms = terms(query);
+        // In a sentence, a single Hangul character such as "뒤" must not make an
+        // otherwise unrelated passage a keyword hit. Literal keyword mode and
+        // single-character queries keep their original substring behavior.
+        let keyword_terms: Vec<_> = if source_code_intent {
+            [
+                "소스코드",
+                "소스 코드",
+                "source code",
+                "source-code",
+                "sourcecode",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        } else if mode == "hybrid"
+            && terms.len() > 1
+            && terms.iter().any(|term| term.chars().count() > 1)
+        {
+            terms
+                .iter()
+                .filter(|term| {
+                    term.chars().count() > 1 || !term.chars().all(|c| ('가'..='힣').contains(&c))
+                })
+                .cloned()
+                .collect()
+        } else {
+            terms.clone()
+        };
         let extension = extension
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!(".{}", value.trim().trim_start_matches('.').to_lowercase()));
@@ -369,16 +403,37 @@ impl Search {
             let db = self.store.connect()?;
             keyword_search(
                 &db,
-                &terms,
+                &keyword_terms,
                 extension.as_deref(),
                 folder,
                 &mut hits,
                 &mut next_hit_order,
             )?;
+            if source_code_intent {
+                for (rank, mut file) in
+                    intent::source_code_files(&db, extension.as_deref(), folder)?
+                        .into_iter()
+                        .enumerate()
+                {
+                    let text = file
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("text")
+                        .and_then(|text| text.as_str().map(str::to_string));
+                    add_hit(
+                        &mut hits,
+                        file,
+                        text,
+                        rank + 1,
+                        "filetype",
+                        &mut next_hit_order,
+                    );
+                }
+            }
         }
 
         let mut actual_mode = "keyword";
-        if mode == "hybrid" {
+        if mode == "hybrid" && !source_code_intent {
             if let Some(model_id) = self.engine.model_id() {
                 match self.query_vector(&model_id, query) {
                     Ok(query_vector) => {
@@ -434,7 +489,9 @@ impl Search {
                 item
             })
             .collect();
-        Ok(json!({"results":output,"mode":actual_mode,"warnings":warnings}))
+        Ok(
+            json!({"results":output,"mode":if source_code_intent {"hybrid"} else {actual_mode},"intent":if source_code_intent {Some("source_code")} else {None},"warnings":warnings}),
+        )
     }
 
     pub fn answer(&self, query: &str, limit: usize) -> Result<Value> {
@@ -525,6 +582,11 @@ impl Search {
             None => streaming_candidates(&tx, model_id, query, extension, folder, candidate_limit)?,
         };
         let has_candidates = !ranked.is_empty();
+        let minimum = semantic_minimum(ranked.first().map(|(score, _)| *score));
+        let ranked: Vec<_> = ranked
+            .into_iter()
+            .filter(|(score, _)| *score >= minimum)
+            .collect();
         let placeholders = std::iter::repeat("?")
             .take(ranked.len())
             .collect::<Vec<_>>()
@@ -549,17 +611,24 @@ impl Search {
                 found.insert(item["result_chunk_id"].as_i64().unwrap_or_default(), item);
             }
         }
-        for (rank, (_, chunk_id)) in ranked.iter().enumerate() {
+        for (rank, (similarity, chunk_id)) in ranked.iter().enumerate() {
             if let Some(mut item) = found.remove(chunk_id) {
                 item.as_object_mut().unwrap().remove("result_chunk_id");
                 let text = item["text"].as_str().unwrap_or_default().to_string();
                 item.as_object_mut().unwrap().remove("text");
+                item["semantic_score"] = json!(similarity);
                 add_hit(hits, item, Some(text), rank + 1, "semantic", next_hit_order);
             }
         }
         tx.commit()?;
         Ok((has_candidates, revision))
     }
+}
+
+fn semantic_minimum(best: Option<f32>) -> f32 {
+    best.map_or(MIN_SEMANTIC_SIMILARITY, |score| {
+        MIN_SEMANTIC_SIMILARITY.max(score - MAX_SEMANTIC_DISTANCE_FROM_BEST)
+    })
 }
 
 struct Hit {
@@ -750,6 +819,9 @@ fn add_hit(
     let id = file["id"].as_i64().unwrap_or_default();
     let contribution = 1.0 / (40.0 + rank as f64);
     if let Some(existing) = hits.get_mut(&id) {
+        if source == "semantic" {
+            existing.file["semantic_score"] = file["semantic_score"].clone();
+        }
         existing.score += contribution;
         if !existing.match_type.split('+').any(|part| part == source) {
             existing.match_type.push('+');
@@ -1165,7 +1237,178 @@ mod tests {
     }
 
     #[test]
-    fn cached_and_bounded_fallback_match_negative_scores_and_extension_filter() {
+    fn relevance_filter_preserves_keywords_and_rejects_weak_answer_sources() {
+        let (_temp, store, library, root_id) = fixture();
+        let vector = |score: f32| vec![score, (1.0 - score * score).sqrt()];
+        for (name, score) in [
+            ("strong.txt", 0.90),
+            ("near.md", 0.87),
+            ("weak.txt", 0.80),
+            ("needle-low.hwp", 0.69),
+        ] {
+            add_document(
+                &store,
+                &library,
+                root_id,
+                name,
+                vec![vector(score)],
+                "google-a",
+            );
+        }
+        for bytes in [0, 1_000_000] {
+            let search = Search::with_cache_limit(
+                store.clone(),
+                Arc::new(FixtureEngine::new("google-a")),
+                bytes,
+            );
+            let result = search
+                .search("zeta omega absent", 10, None, "hybrid")
+                .unwrap();
+            let names: Vec<_> = result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["strong.txt", "near.md"]);
+            assert!(result["results"][0]["semantic_score"].as_f64().unwrap() > 0.89);
+            let answer = search.answer("zeta omega absent", 5).unwrap();
+            assert_eq!(answer["sources"].as_array().unwrap().len(), 2);
+            assert!(
+                search
+                    .search("zeta omega absent", 10, Some("hwp"), "hybrid")
+                    .unwrap()["results"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let literal = search.search("needle", 10, Some("hwp"), "hybrid").unwrap();
+            assert_eq!(literal["results"][0]["name"], "needle-low.hwp");
+            assert_eq!(literal["results"][0]["match_type"], "filename");
+        }
+    }
+
+    #[test]
+    fn a_short_sentence_fragment_does_not_override_natural_language_relevance() {
+        let (_temp, store, library, root_id) = fixture();
+        let path = library.join("recipe.txt");
+        std::fs::write(&path, "볶은 뒤 끓입니다.").unwrap();
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path,
+                size: 20,
+                modified: 1,
+                passages: vec![Passage {
+                    text: "볶은 뒤 끓입니다.".into(),
+                    location: "본문".into(),
+                }],
+                vectors: Some(vec![vec![0.0, 1.0]]),
+                model_id: Some("google-a".into()),
+                error: None,
+                reader_id: "test".into(),
+            }])
+            .unwrap();
+        let search = Search::new(store, Arc::new(FixtureEngine::new("google-a")));
+        assert!(
+            search
+                .search("이사 나간 뒤 맡긴 돈", 10, None, "hybrid")
+                .unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            search.search("뒤", 10, None, "hybrid").unwrap()["results"][0]["name"],
+            "recipe.txt"
+        );
+        assert_eq!(
+            search
+                .search("이사 나간 뒤 맡긴 돈", 10, None, "keyword")
+                .unwrap()["results"][0]["name"],
+            "recipe.txt"
+        );
+    }
+
+    #[test]
+    fn explicit_source_code_search_uses_file_kind_without_embedding_or_unrelated_hwp() {
+        let (_temp, store, library, root_id) = fixture();
+        for name in [
+            "main.rs",
+            "tool.py",
+            "unrelated.hwp",
+            "소스코드_목록.txt",
+            "소스코드_검토.hwp",
+        ] {
+            add_document(
+                &store,
+                &library,
+                root_id,
+                name,
+                vec![vec![1.0, 0.0]],
+                "google-a",
+            );
+        }
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path: library.join("unrelated.hwp"),
+                size: 50,
+                modified: 1,
+                passages: vec![Passage {
+                    text: "프로젝트 코드 오로라-3147은 파란 서랍에 보관한다.".into(),
+                    location: "본문".into(),
+                }],
+                vectors: Some(vec![vec![1.0, 0.0]]),
+                model_id: Some("google-a".into()),
+                error: None,
+                reader_id: "test".into(),
+            }])
+            .unwrap();
+        let engine = Arc::new(FixtureEngine::new("google-a"));
+        let search = Search::new(store, engine.clone());
+        let result = search.search("소스코드", 10, None, "hybrid").unwrap();
+        let names: Vec<_> = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert!(
+            names.contains(&"main.rs")
+                && names.contains(&"tool.py")
+                && names.contains(&"소스코드_목록.txt")
+        );
+        assert_eq!(result["intent"], "source_code");
+        for alias in ["소스 코드", "source code", "SOURCE-CODE"] {
+            let aliased = search.search(alias, 10, None, "hybrid").unwrap();
+            assert_eq!(aliased["results"].as_array().unwrap().len(), 4);
+            assert!(
+                !aliased["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["name"] == "unrelated.hwp")
+            );
+        }
+        assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 0);
+        let hwp = search
+            .search("소스코드", 10, Some("hwp"), "hybrid")
+            .unwrap();
+        assert_eq!(hwp["results"].as_array().unwrap().len(), 1);
+        assert_eq!(hwp["results"][0]["name"], "소스코드_검토.hwp");
+        assert_eq!(
+            search.search("소스코드", 10, None, "keyword").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cached_and_bounded_fallback_reject_negative_similarity() {
         let (_temp, store, library, root_id) = fixture();
         add_document(
             &store,
@@ -1208,15 +1451,16 @@ mod tests {
                 .map(|item| item["name"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            names(&cached_result),
-            vec!["negative.txt", "less-negative.md", "different.pdf"]
+        assert!(names(&cached_result).is_empty());
+        assert!(
+            cached_result["warnings"].as_array().unwrap().is_empty(),
+            "filtered candidates are not a missing index"
         );
         assert_eq!(names(&fallback_result), names(&cached_result));
         let filtered = fallback
             .search("another semantic intent", 10, Some("txt"), "hybrid")
             .unwrap();
-        assert_eq!(names(&filtered), vec!["negative.txt"]);
+        assert!(names(&filtered).is_empty());
         assert!(fallback.vectors.lock().unwrap().snapshot.is_none());
     }
 
@@ -1300,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_cosine_ties_keep_higher_chunk_order_in_cache_and_fallback() {
+    fn zero_cosine_is_not_relevant_in_cache_and_fallback() {
         assert_eq!(
             Candidate(-0.0, 1).cmp(&Candidate(0.0, 1)),
             Ordering::Equal,
@@ -1341,7 +1585,7 @@ mod tests {
             .iter()
             .map(|item| item["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(cached_names, vec!["zero-b.txt", "zero-a.txt"]);
+        assert!(cached_names.is_empty());
         assert_eq!(fallback_names, cached_names);
     }
 
