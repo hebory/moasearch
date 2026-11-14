@@ -11,3 +11,4 @@
 :root{--scope-bg:#eff4ef;--scope-line:#dbe7dc}.root-add-dialog{width:min(470px,calc(100% - 30px))}.root-add-content{padding:26px 28px 24px}.root-add-content h2{margin:5px 0;font-size:20px;letter-spacing:-.6px}.root-add-content>.dialog-intro{margin:6px 0 18px}.root-add-content .field-label input{min-height:40px}.root-add-actions{margin-top:4px}.root-add-actions button{min-width:72px}
 
 .field-label textarea{width:100%;min-height:48px;resize:vertical;padding:7px 9px;border:1px solid #e3e4dd;border-radius:6px;background:white;color:#393b34;font:inherit;font-size:11px}.field-label textarea:focus{outline:3px solid #8fb5a166;outline-offset:2px}.filename-only-note{margin-top:15px;padding:12px;border:1px solid #e4ebe1;border-radius:7px;background:#f5f8f3;color:#68766a;font-size:11px}
+.results-heading{gap:16px;flex-wrap:wrap}.results-heading>div:first-child{min-width:0;flex:1 1 260px}.result-tools{flex:0 0 auto;flex-wrap:wrap}.ask-button{white-space:nowrap}
