@@ -358,6 +358,11 @@ impl Indexer {
             .unwrap_or(4096)
             .clamp(512, 32768);
         let file_limit = settings["max_file_mb"].as_u64().unwrap_or(32) * 1024 * 1024;
+        let filename_only_names = config::filename_only_names(
+            settings["filename_only_dirs"]
+                .as_str()
+                .unwrap_or("_site,temp,vendor"),
+        );
         let mut db = self.store.connect()?;
         let (mut scanned, mut skipped, mut indexed) = (0u64, 0u64, 0u64);
         let mut reused_files = 0u64;
@@ -377,11 +382,22 @@ impl Indexer {
             let root_id = root["id"].as_i64().unwrap();
             let mut seen = HashSet::new();
             let mut failed = false;
-            let mut directories = vec![base.clone()];
+            let root_filename_only =
+                config::filename_only_directory(&base, &base, &filename_only_names);
+            let mut directories = Vec::new();
+            let mut filename_only_directories = Vec::new();
+            if root_filename_only {
+                filename_only_directories.push(base.clone());
+            } else {
+                directories.push(base.clone());
+            }
             let mut pending = Vec::new();
             let (mut pending_chunks, mut pending_bytes) = (0usize, 0usize);
             let mut since = Instant::now();
-            while let Some(directory) = directories.pop() {
+            while let Some(directory) = directories
+                .pop()
+                .or_else(|| filename_only_directories.pop())
+            {
                 if self.cancelled() {
                     break;
                 }
@@ -421,7 +437,11 @@ impl Indexer {
                         continue;
                     }
                     if metadata.is_dir() {
-                        directories.push(path);
+                        if config::filename_only_directory(&path, &base, &filename_only_names) {
+                            filename_only_directories.push(path);
+                        } else {
+                            directories.push(path);
+                        }
                         continue;
                     }
                     if !metadata.is_file() {
@@ -444,6 +464,47 @@ impl Indexer {
                         reader.to_owned()
                     };
                     let old = Store::file_by_path_on(&db, &path)?;
+                    let filename_only = config::filename_only(&path, &base, &filename_only_names);
+                    if filename_only {
+                        let filename_reader = format!("filename-only-v1:{reader}");
+                        let unchanged = old.as_ref().is_some_and(|old| {
+                            old["modified"].as_i64() == Some(modified)
+                                && old["size"].as_u64() == Some(metadata.len())
+                                && old["status"] == "metadata"
+                                && old["reader_id"].as_str() == Some(&filename_reader)
+                        });
+                        if unchanged {
+                            skipped += 1;
+                            self.update(json!({"skipped":skipped}));
+                            continue;
+                        }
+                        if pending.is_empty() {
+                            since = Instant::now();
+                        }
+                        pending.push(FileRecord {
+                            root_id,
+                            path,
+                            size: metadata.len() as i64,
+                            modified,
+                            passages: Vec::new(),
+                            vectors: None,
+                            model_id: None,
+                            error: None,
+                            reader_id: filename_reader,
+                            content_key: None,
+                        });
+                        if pending.len() >= 32
+                            || pending_chunks >= 256
+                            || pending_bytes >= 4 * 1024 * 1024
+                            || since.elapsed() >= Duration::from_millis(500)
+                        {
+                            self.flush(&mut db, &mut pending, &mut indexed)?;
+                            pending_chunks = 0;
+                            pending_bytes = 0;
+                            since = Instant::now();
+                        }
+                        continue;
+                    }
                     let content_eligible =
                         metadata.len() <= file_limit && extract::supports_content(&path);
                     let extension = path

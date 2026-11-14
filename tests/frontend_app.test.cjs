@@ -65,6 +65,11 @@ class Element {
   close() { this.open = false; }
 }
 
+class FormDataMock {
+  constructor(form) { this.form = form; }
+  get(name) { return this.form.elements.namedItem(name).value; }
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -82,7 +87,7 @@ function createApp() {
   const submitButton = new Element('button');
   elements.get('settings-form').submitButton = submitButton;
   elements.get('settings-form').namedItems = new Map([
-    'embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb',
+    'embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb','filename_only_dirs',
   ].map(key => [key, new Element('input')]));
   const documentListeners = new Map();
   const modeButtons = ['hybrid', 'keyword'].map(mode => {
@@ -123,6 +128,7 @@ function createApp() {
     location: window.location,
     history: { replaceState() {} },
     URLSearchParams,
+    FormData: FormDataMock,
     Intl,
     setTimeout: setTimer,
     clearTimeout: clearTimer,
@@ -301,6 +307,37 @@ test('explains hybrid versus keyword search and preserves each match signal in r
   query.value = '일반 검색';
   query.dispatch('input');
   assert.match(hint.textContent, /파일명·경로와 본문에서 찾습니다/);
+});
+
+test('restores and saves filename-only folder settings including an empty value', async () => {
+  const app = createApp();
+  app.resolveStatus({ settings: { filename_only_dirs: '_site,temp,vendor' } });
+  await flushAsyncWork();
+  app.elements.get('open-settings').dispatch('click');
+  const input = app.elements.get('settings-form').elements.namedItem('filename_only_dirs');
+  assert.equal(input.value, '_site,temp,vendor');
+  input.value = '';
+  app.elements.get('settings-form').dispatch('submit');
+  const update = app.call('update_settings')[0];
+  assert.equal(update.args.settings.filename_only_dirs, '');
+});
+
+test('explains when a selected folder has filename-only indexing', async () => {
+  const app = createApp();
+  app.resolveStatus();
+  await flushAsyncWork();
+  app.elements.get('query').value = '배포 파일';
+  app.elements.get('search-form').dispatch('submit');
+  app.call('search')[0].resolve({ results: [searchResult(14, 'index.html')] });
+  await flushAsyncWork();
+  app.call('file')[0].resolve({
+    ...searchResult(14, 'index.html'),
+    reader_id: 'filename-only-v1:text-v1',
+    passages: [],
+  });
+  await flushAsyncWork();
+  assert.match(textTree(app.elements.get('preview')), /설정에 따라 파일명·경로만 색인했어요/);
+  assert.doesNotMatch(textTree(app.elements.get('preview')), /색인이 아직 진행 중/);
 });
 
 test('answer request rechecks the live input against the completed search query', async () => {

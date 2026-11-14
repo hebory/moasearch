@@ -198,6 +198,37 @@ impl Store {
         if let Some(key) = input.keys().find(|key| !known.contains(key.as_str())) {
             bail!("알 수 없는 설정입니다: {key}");
         }
+        if let Some(value) = input.get("filename_only_dirs") {
+            let raw = value.as_str().ok_or_else(|| {
+                anyhow!("filename_only_dirs: 폴더 이름 목록 문자열이 필요합니다.")
+            })?;
+            let mut seen = HashSet::new();
+            let mut names = Vec::new();
+            for item in raw
+                .split(|ch| matches!(ch, ',' | ';' | '\n'))
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
+                if item == "."
+                    || item == ".."
+                    || item.ends_with('.')
+                    || item.chars().any(|ch| {
+                        ch.is_control()
+                            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+                    })
+                {
+                    bail!("filename_only_dirs에는 경로가 아닌 폴더 이름만 입력하세요: {item}");
+                }
+                let folded = item.to_lowercase();
+                if seen.insert(folded.clone()) {
+                    names.push(folded);
+                }
+            }
+            normalized.insert(
+                "filename_only_dirs".to_string(),
+                Value::String(names.join(",")),
+            );
+        }
         for (key, kind) in [
             ("embedding_model", crate::models::ModelKind::Embedding),
             ("chat_model", crate::models::ModelKind::Chat),
@@ -1092,5 +1123,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn filename_only_directory_settings_normalize_deduplicate_and_allow_empty() {
+        let temp = test_tempdir("store-filename-only-settings-");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store
+            .update_settings(&json!({"filename_only_dirs":" _SITE, Temp;\r\n vendor, TEMP "}))
+            .unwrap();
+        assert_eq!(saved["filename_only_dirs"], "_site,temp,vendor");
+        let saved = store
+            .update_settings(&json!({"filename_only_dirs":""}))
+            .unwrap();
+        assert_eq!(saved["filename_only_dirs"], "");
+    }
+
+    #[test]
+    fn invalid_filename_only_directory_paths_leave_settings_unchanged() {
+        let temp = test_tempdir("store-filename-only-invalid-");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update_settings(&json!({"filename_only_dirs":"_site,temp"}))
+            .unwrap();
+        for invalid in ["../private", "folder\\child", "C:\\private", "*cache"] {
+            assert!(
+                store
+                    .update_settings(&json!({"filename_only_dirs":invalid}))
+                    .is_err()
+            );
+            assert_eq!(
+                store.settings().unwrap()["filename_only_dirs"],
+                "_site,temp"
+            );
+        }
     }
 }

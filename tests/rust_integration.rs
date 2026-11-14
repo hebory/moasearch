@@ -465,6 +465,143 @@ fn file_content_cache_identity_invalidates_for_changed_content_extension_context
 }
 
 #[test]
+fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_cleared() -> Result<()>
+{
+    let dir = scratch()?;
+    let docs = dir.path().join("documents");
+    let normal = docs.join("normal");
+    let site = docs.join("_site");
+    let temp = docs.join("TEMP");
+    let vendor = docs.join("vendor");
+    for folder in [&normal, &site, &temp, &vendor] {
+        std::fs::create_dir_all(folder)?;
+    }
+
+    let shared_body = "공통 배포 산출물 본문 원본 페이지 clone payload";
+    std::fs::write(normal.join("source-page.txt"), shared_body)?;
+    std::fs::write(site.join("site-clone.txt"), shared_body)?;
+    std::fs::write(temp.join("temp-clone.txt"), shared_body)?;
+    std::fs::write(vendor.join("vendor-clone.txt"), shared_body)?;
+    std::fs::write(
+        site.join("site-only-file.txt"),
+        "SITE_ONLY_BODY_TOKEN 생성 본문",
+    )?;
+    std::fs::write(
+        temp.join("temp-only-file.txt"),
+        "TEMP_ONLY_BODY_TOKEN 생성 본문",
+    )?;
+    std::fs::write(
+        vendor.join("vendor-only-file.txt"),
+        "VENDOR_ONLY_BODY_TOKEN 생성 본문",
+    )?;
+    std::fs::write(
+        docs.join("_site-marker.txt"),
+        "root level named directory marker body",
+    )?;
+
+    let store = Arc::new(Store::open(dir.path().join("data"))?);
+    store.add_root(&docs)?;
+    store.update_settings(&json!({"filename_only_dirs":""}))?;
+    let engine = Arc::new(NamedEngine {
+        id: "fixture-google".into(),
+        calls: AtomicUsize::new(0),
+    });
+
+    let initial_indexer = Indexer::new(store.clone(), engine.clone());
+    assert!(initial_indexer.start());
+    let initial = wait(&initial_indexer);
+    assert_eq!(initial["phase"], "complete");
+    assert_eq!(store.counts()?["files"], 8);
+    assert_eq!(store.counts()?["chunks"], 8);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+
+    store.update_settings(&json!({"filename_only_dirs":"_site, temp, VENDOR"}))?;
+    let policy_indexer = Indexer::new(store.clone(), engine.clone());
+    assert!(policy_indexer.start());
+    let policy = wait(&policy_indexer);
+    assert_eq!(policy["phase"], "complete");
+    assert_eq!(policy["indexed"], 6);
+    assert_eq!(policy["skipped"], 2);
+    assert_eq!(store.counts()?["files"], 8);
+    assert_eq!(store.counts()?["chunks"], 2);
+    assert_eq!(store.counts()?["vectors"], 2);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+
+    let db = store.connect()?;
+    let metadata_rows: i64 = db.query_row(
+        "SELECT count(*) FROM files WHERE reader_id LIKE 'filename-only-v1:%' AND status='metadata'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(metadata_rows, 6);
+    let remaining_keys: i64 = db.query_row(
+        "SELECT count(*) FROM file_content_keys k JOIN files f ON f.id=k.file_id WHERE f.reader_id LIKE 'filename-only-v1:%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(remaining_keys, 0);
+    drop(db);
+
+    let stable_indexer = Indexer::new(store.clone(), engine.clone());
+    assert!(stable_indexer.start());
+    let stable = wait(&stable_indexer);
+    assert_eq!(stable["phase"], "complete");
+    assert_eq!(stable["indexed"], 0);
+    assert_eq!(stable["skipped"], 8);
+    assert_eq!(store.counts()?["chunks"], 2);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+
+    let search = Search::new(store.clone(), engine.clone());
+    for body_token in [
+        "SITE_ONLY_BODY_TOKEN",
+        "TEMP_ONLY_BODY_TOKEN",
+        "VENDOR_ONLY_BODY_TOKEN",
+    ] {
+        assert!(
+            search.search(body_token, 10, None, "keyword")?["results"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "generated body became searchable: {body_token}"
+        );
+    }
+    let filename = search.search("site-only-file.txt", 10, None, "keyword")?;
+    assert!(
+        filename["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["name"] == "site-only-file.txt" && row["status"] == "metadata" })
+    );
+    let root_file = search.search("_site-marker.txt", 10, None, "keyword")?;
+    assert!(
+        root_file["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "_site-marker.txt" && row["status"] == "content")
+    );
+
+    store.update_settings(&json!({"filename_only_dirs":""}))?;
+    let restored_indexer = Indexer::new(store.clone(), engine.clone());
+    assert!(restored_indexer.start());
+    let restored = wait(&restored_indexer);
+    assert_eq!(restored["phase"], "complete");
+    assert_eq!(restored["indexed"], 6);
+    assert_eq!(restored["reused"], 3);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 8);
+    assert_eq!(store.counts()?["files"], 8);
+    assert_eq!(store.counts()?["chunks"], 8);
+    assert_eq!(store.counts()?["vectors"], 8);
+    let restored_search = Search::new(store, engine);
+    assert_eq!(
+        restored_search.search("SITE_ONLY_BODY_TOKEN", 10, None, "keyword")?["results"][0]["name"],
+        "site-only-file.txt"
+    );
+    Ok(())
+}
+
+#[test]
 fn cancellation_preserves_prior_records_and_publishes_completed_files() -> Result<()> {
     let dir = scratch()?;
     let docs = dir.path().join("documents");
