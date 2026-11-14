@@ -265,9 +265,14 @@ impl EmbeddedEngine {
         // Size both batches for the longest retained input, not the configured
         // context ceiling, to avoid allocating large buffers for short texts.
         let capacity = u32::try_from(max_tokens)?;
+        let threads = std::thread::available_parallelism()
+            .map(|available| available.get().min(8))
+            .unwrap_or(4) as i32;
         Ok(Self::context_params(settings, true)
             .with_n_batch(capacity)
-            .with_n_ubatch(capacity))
+            .with_n_ubatch(capacity)
+            .with_n_threads(threads)
+            .with_n_threads_batch(threads))
     }
 
     fn embed_locked(

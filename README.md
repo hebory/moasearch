@@ -153,6 +153,7 @@ cargo run --release --locked --example smoke_ai -- .moasearch-verify-ai .moasear
 cargo run --release --locked --example smoke_formats -- .moasearch-verify-formats .moasearch-rust-dev/models
 $env:MOASEARCH_EMBEDDING_MODEL = "$PWD\.moasearch-rust-dev\models\embeddinggemma-2-Q8_0.gguf"
 cargo run --release --locked --example verify_long_embeddings
+cargo run --release --locked --example benchmark_embedding_threads
 ```
 
 ## 모델·구현 출처
