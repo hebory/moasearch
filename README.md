@@ -145,6 +145,8 @@ $env:MOASEARCH_OCR_MODELS = "$PWD\.moasearch-rust-dev\models"
 cargo test --release --locked --test rust_formats -- --ignored
 cargo run --release --locked --example smoke_ai -- .moasearch-verify-ai .moasearch-rust-dev/models
 cargo run --release --locked --example smoke_formats -- .moasearch-verify-formats .moasearch-rust-dev/models
+$env:MOASEARCH_EMBEDDING_MODEL = "$PWD\.moasearch-rust-dev\models\embeddinggemma-2-Q8_0.gguf"
+cargo run --release --locked --example verify_long_embeddings
 ```
 
 ## 모델·구현 출처
