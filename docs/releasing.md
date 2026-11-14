@@ -11,7 +11,7 @@
 ```powershell
 $licenses = .\packaging\collect-licenses.ps1 | ConvertFrom-Json
 .\packaging\release.ps1 `
-  -Version 0.4.2 `
+  -Version 0.4.3 `
   -SkipBuild `
   -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
   -CrtDirectory "$env:SystemRoot\System32" `
@@ -22,9 +22,9 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 `dist\artifacts\`에 다음 공개 파일이 생성됩니다.
 
-- `moasearch-0.4.2-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
-- `moasearch-0.4.2-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
-- `moasearch-0.4.2-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
+- `moasearch-0.4.3-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
+- `moasearch-0.4.3-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
+- `moasearch-0.4.3-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
 - `SHA256SUMS.txt`: 설치기·ZIP·배포 명세·아이콘·커버·카탈로그 총 6개 파일의 SHA-256 (체크섬 파일 자신은 제외)
 - `icon.png`, `cover.png`: Moa Launcher 앱 아이콘과 커버
 - `moalauncher.json`: Moa Launcher 카탈로그 등록 메타데이터
@@ -39,13 +39,13 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 설치기는 Windows 10/11 x64에서 `{localappdata}\Programs\moasearch` 아래에 현재 사용자 권한으로 설치합니다. 로컬 AI 기능은 AVX2를 지원하는 x64 CPU가 필요합니다. 관리자 권한을 요구하지 않습니다. `/SILENT /DIR="<경로>" /NORESTART` 옵션을 지원하며, 자동 설치에서는 앱을 시작하지 않습니다. 대화형 설치에서는 완료 화면의 실행 선택 항목을 제공합니다.
 
-직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.4.2에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.4.2은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
+직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.4.3에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.4.3은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
 
 **탐색기에서 현재 폴더 검색** 옵션은 현재 사용자 `HKCU\Software\Classes` 아래의 `Directory\shell\MoaSearch.SearchFolder`와 `Directory\Background\shell\MoaSearch.SearchBackground`를 등록합니다. 옵션 해제 업데이트와 설치 제거 시 이 두 앱 전용 키를 정리합니다. 폴더와 빈 공간의 명령은 각각 `%1`, `%V` 경로를 `open-folder --path`에 전달하며, 드라이브 루트의 끝 역슬래시가 인용부호와 충돌하지 않도록 `\.`을 붙입니다. Windows 11에서는 **추가 옵션 표시**에 나타날 수 있습니다. 등록 형식은 [Microsoft Shell 문서](https://learn.microsoft.com/windows/win32/shell/reg-shell-exts), 설치·제거 조건은 [Inno Setup Registry 문서](https://jrsoftware.org/ishelp/topic_registrysection.htm)를 따릅니다.
 
 ## Moa Launcher 카탈로그
 
-Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.4.2`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.4.2-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.4.2-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
+Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.4.3`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.4.3-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.4.3-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
 
 Moa Launcher는 앱의 루트에서 공개 `icon.png`와 `cover.png`를 표시합니다. 이 이미지를 저장소 기본 브랜치에 게시하고 카탈로그의 앱 항목에서 해당 GitHub 이미지 주소를 참조하세요. `assets\branding\moasearch.ico`는 Windows 설치기의 아이콘이고, 모아 런처 상세 화면의 PNG 아이콘과 커버를 대체하지 않습니다.
 
@@ -134,3 +134,16 @@ Microsoft Visual C++ Runtime은 배포 가능 구성요소와 계약에 따라 �
 - 모아런처 카드 설명, README와 구조 문서에 용도·양자화·파일명을 명시.
 
 고정 모델 파일·revision·SHA-256과 추론·색인 동작은 변경하지 않았습니다.
+
+## v0.4.3 검색 관련성 검증
+
+2026-11-14 `소스코드` 검색에 의미적으로 무관한 HWP/HWPX가 포함되는 사례를 재현하고 검색 정책을 수정했습니다.
+
+- Rust 단위·통합 테스트 49개와 화면·IPC 테스트 12개 통과. 기본 실행에서 모델 파일이 필요한 OCR 테스트 1개는 제외했습니다. 마지막 별칭 보완 후 검색 관련 테스트 16개를 다시 통과했습니다.
+- `evaluate_relevance`가 고정 EmbeddingGemma 2 Q8_0와 가상 추출 본문 12개를 사용해 8개 질의의 기대 결과를 확인했습니다. 모든 질의가 통과했습니다. `소스코드`의 결과는 무관한 문서가 섞인 12개에서 소스 파일·관련 문서 5개로 줄었고, 자료에 없는 두 주제는 0개였습니다. 자연어 질의의 영수증·회의·임대차·여행 결과도 유지됐습니다.
+- 음수·0·낮은 의미 유사도 제외, 키워드 결과 유지, 캐시와 스트리밍 경로의 일치, 답변 근거 필터, 폴더·확장자 제한과 소스코드 별칭을 검증했습니다. 새 입력에서 이전 목록을 바로 비우고 검색 근거를 모두 표시하는 화면 동작도 검증했습니다.
+- 최종 실행 파일로 탐색기 연결, 동시 실행 시 앱 재사용, 데이터 위치 격리, 폴더 범위 분리와 TCP 리스너 0개를 확인했습니다.
+- 실제 설치를 v0.4.3로 업데이트하고 같은 사용자 색인의 검색 결과를 전후 비교했습니다. 기존 `소스코드` 결과는 8개로 의미 후보 HWP/HWPX 2개를 포함했으며, 업데이트 후 `소스코드`·`소스 코드` 결과는 모두 0개였습니다. 색인 카운트와 임베딩 모델 설정을 보존했습니다.
+- 실제 앱 창에서 `소스코드`를 입력해 파일 종류 검색 안내와 빈 결과를 확인했습니다. 이전 카드가 남지 않고 검색 대기 상태를 거쳐 새 결과를 표시했습니다.
+
+관련도 기준은 현재 모델과 가상 평가 집합에 맞춘 보수적 휴리스틱입니다. 전체 사용자 문서의 오탐·누락을 없앤다는 보장은 아니며, 상세 기준과 평가 범위는 [검색 관련도 정책](search-relevance.md)에 기록했습니다. 모델 파일이나 데이터 스키마를 바꾸지 않아 전체 재색인은 필요하지 않습니다.
