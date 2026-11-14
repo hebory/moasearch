@@ -189,21 +189,25 @@ impl EmbeddedEngine {
                 .unwrap_or_default()
                 .contains("qwen")
         {
-            problems
-                .push("Qwen 모델은 지원하지 않습니다. Google Gemma 모델을 선택하세요.".to_string());
+            problems.push(
+                "검색에는 EmbeddingGemma 2 Q8_0, 답변에는 Gemma 4 E2B IT QAT Q4_0를 선택하세요."
+                    .to_string(),
+            );
         }
         if embedding_path.is_some() && !embedding_ready {
             problems.push(
-                "EmbeddingGemma 2 파일이 없거나 크기·GGUF 서명이 올바르지 않습니다.".to_string(),
+                "EmbeddingGemma 2 Q8_0 파일이 없거나 크기·GGUF 서명이 올바르지 않습니다."
+                    .to_string(),
             );
         }
         if chat_path.is_some() && !chat_ready {
             problems.push(
-                "Google Gemma 답변 파일이 없거나 크기·GGUF 서명이 올바르지 않습니다.".to_string(),
+                "Gemma 4 E2B IT QAT Q4_0 파일이 없거나 크기·GGUF 서명이 올바르지 않습니다."
+                    .to_string(),
             );
         }
         if embedding_path.is_none() {
-            problems.push("설정에서 EmbeddingGemma 2 모델을 준비하세요.".to_string());
+            problems.push("설정에서 EmbeddingGemma 2 Q8_0를 준비하세요.".to_string());
         }
         if !last_error.is_empty() {
             problems.push(last_error);
@@ -332,7 +336,7 @@ impl EmbeddedEngine {
 
         let mut ctx = model
             .new_context(backend, Self::context_params(settings, false))
-            .context("Gemma 답변 컨텍스트를 만들 수 없습니다")?;
+            .context("Gemma 4 E2B IT QAT Q4_0 답변 컨텍스트를 만들 수 없습니다")?;
         let mut batch = LlamaBatch::new(tokens.len().saturating_add(1), 1);
         batch
             .add_sequence(&tokens, 0, false)
@@ -355,11 +359,11 @@ impl EmbeddedEngine {
             next.add(token, pos, &[0], true)
                 .context("답변 토큰을 추가할 수 없습니다")?;
             ctx.decode(&mut next)
-                .context("Gemma 답변 생성이 중단되었습니다")?;
+                .context("Gemma 4 E2B IT QAT Q4_0 답변 생성이 중단되었습니다")?;
         }
         let answer = String::from_utf8_lossy(&answer).trim().to_string();
         if answer.is_empty() {
-            bail!("Gemma가 빈 답변을 반환했습니다.");
+            bail!("Gemma 4 E2B IT QAT Q4_0가 빈 답변을 반환했습니다.");
         }
         Ok(answer)
     }
@@ -418,7 +422,7 @@ impl Embedder for EmbeddedEngine {
 
 fn normalize(vector: &mut [f32]) -> Result<()> {
     if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
-        bail!("Google 모델이 비어 있거나 올바르지 않은 임베딩을 반환했습니다.");
+        bail!("EmbeddingGemma 2 Q8_0가 비어 있거나 올바르지 않은 임베딩을 반환했습니다.");
     }
     let norm = vector
         .iter()
@@ -426,7 +430,7 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
         .sum::<f64>()
         .sqrt();
     if !norm.is_finite() || norm <= f64::EPSILON {
-        bail!("Google 모델의 임베딩 벡터 크기가 0입니다.");
+        bail!("EmbeddingGemma 2 Q8_0 임베딩 벡터 크기가 0입니다.");
     }
     for value in vector {
         *value = (f64::from(*value) / norm) as f32;

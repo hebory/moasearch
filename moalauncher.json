@@ -4,7 +4,7 @@
     {
       "id": "moasearch",
       "name": "모아검색",
-      "description": "Google 로컬 AI로 파일의 내용과 의미를 검색합니다. 이미지·스캔 PDF OCR과 HWP/HWPX를 지원합니다.",
+      "description": "EmbeddingGemma 2 Q8_0로 의미를 검색하고 Gemma 4 E2B IT QAT Q4_0로 답변합니다. PP-OCRv5 이미지·스캔 PDF OCR과 HWP/HWPX 본문 검색을 지원합니다.",
       "category": "파일 · AI 검색",
       "accentColor": "#436F5D",
       "monogram": "Ms",

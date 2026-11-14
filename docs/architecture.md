@@ -9,7 +9,7 @@
 - `extract.rs`, `ocr.rs`, `pdf.rs`: 텍스트·Office·HWP/HWPX, Rust ONNX OCR·Windows PDF 렌더
 - `indexer.rs`: 단일 색인 작업, 취소, 증분 검사, 완료된 파일 배치 저장
 - `search.rs`: 문자열·정확 코사인 검색, 파일별 최고 청크, RRF, 벡터·질의 캐시
-- `models.rs`, `engine.rs`: 고정 Google 모델 다운로드·검증, 내장 추론
+- `models.rs`, `engine.rs`: Google EmbeddingGemma 2 Q8_0·Gemma 4 E2B IT QAT Q4_0 다운로드·검증 및 내장 추론
 - `commands.rs`: 화면·CLI에서 공유하는 명령 DTO, 요청 인자와 검색어 검증
 - `service.rs`: 색인·검색·답변·범위·설정·파일 동작·모델 다운로드와 종료 책임
 - `main.rs`: CLI, 앱 시작, UI가 없는 명령 실행
@@ -28,9 +28,15 @@ Windows 명명된 파이프는 사용자와 정규화 데이터 경로에 맞는
 
 ## 데이터와 모델 전환
 
-기존 `settings`, `roots`, `files`, `chunks`, FTS 테이블과 `index_meta`를 보존한다. DB 경로는 이전과 같이 `%LOCALAPPDATA%/MoaSearch/index.sqlite3`다. Qwen 설정은 해제하고 기존 벡터는 새 Google 모델 ID와 격리한다. 본문은 계속 키워드 검색에 사용할 수 있으며, 재색인 시 Rust 리더와 Google 임베딩으로 교체한다.
+기존 `settings`, `roots`, `files`, `chunks`, FTS 테이블과 `index_meta`를 보존한다. DB 경로는 이전과 같이 `%LOCALAPPDATA%/MoaSearch/index.sqlite3`다. Qwen 설정은 해제하고 기존 벡터는 새 Google 모델 ID와 격리한다. 본문은 계속 키워드 검색에 사용할 수 있으며, 재색인 시 Rust 리더와 Google EmbeddingGemma 2 Q8_0 임베딩으로 교체한다.
 
-EmbeddingGemma 2는 `task: search result | query: ...`와 `title: none | text: ...` 형식을 사용한다. Google Gemma 4 E2B는 검색된 구간에 번호를 붙인 문서 기반 답변을 생성한다. 모델별 SHA-256·버전을 고정하며, 사용자가 지정한 경로라도 승인된 Google 파일인지 새로 로드할 때마다 확인한다. 상태 화면은 파일 크기·형식의 기초 검사 결과를 표시한다. 대화 모델과 임베딩 모델을 번갈아 메모리에 유지한다.
+| 역할 | 고정 모델 | 양자화 | 파일 |
+| --- | --- | --- | --- |
+| 텍스트 의미 검색 | Google EmbeddingGemma 2 | Q8_0 | `embeddinggemma-2-Q8_0.gguf` |
+| 문서 기반 답변 | Google Gemma 4 E2B IT QAT | Q4_0 | `gemma-4-E2B_q4_0-it.gguf` |
+| 이미지·스캔 PDF 문자 인식 | PP-OCRv5 한국어·영어 ONNX 모델 | 해당 없음 | `ch_PP-OCRv5_det_mobile.onnx`, `korean_PP-OCRv5_rec_mobile.onnx` |
+
+EmbeddingGemma 2는 `task: search result | query: ...`와 `title: none | text: ...` 형식을 사용한다. Gemma 4 E2B IT QAT Q4_0는 검색된 구간에 번호를 붙인 문서 기반 답변을 생성한다. PP-OCRv5는 GGUF 언어 모델이 아닌 전용 ONNX OCR 모델이다. GGUF 모델별 SHA-256·버전을 고정하며, 사용자가 지정한 경로라도 승인된 Google 파일인지 새로 로드할 때마다 확인한다. 상태 화면은 파일 크기·형식의 기초 검사 결과를 표시한다. 대화 모델과 임베딩 모델을 번갈아 메모리에 유지한다.
 
 ## 색인·검색
 

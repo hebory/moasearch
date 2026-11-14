@@ -225,10 +225,10 @@ impl AppServices {
                 state["running"] = json!(false);
                 match result {
                     Ok(()) => {
-                        state["message"] = json!(if worker_kind == "ocr" {
-                            "OCR 모델 준비 완료. 다시 색인하면 이미지와 스캔 PDF 본문을 읽습니다."
-                        } else {
-                            "모델 준비 완료. 다시 색인하면 Google 모델로 검색합니다."
+                        state["message"] = json!(match worker_kind.as_str() {
+                            "ocr" => "PP-OCRv5 준비 완료. 다시 색인하면 이미지와 스캔 PDF 본문을 읽습니다.",
+                            "embedding" => "EmbeddingGemma 2 Q8_0 준비 완료. 다시 색인하면 의미 검색에 사용합니다.",
+                            _ => "Gemma 4 E2B IT QAT Q4_0 준비 완료. 검색한 문서를 근거로 답변합니다.",
                         })
                     }
                     Err(error) => {

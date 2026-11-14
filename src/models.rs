@@ -161,7 +161,7 @@ pub const CHAT: ModelSpec = ModelSpec {
     filename: "gemma-4-E2B_q4_0-it.gguf",
     bytes: 3_349_516_256,
     sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
-    description: "Google Gemma 4 E2B QAT Q4_0 답변 모델 (약 3.35 GB)",
+    description: "Google Gemma 4 E2B IT QAT Q4_0 답변 모델 (약 3.35 GB)",
 };
 
 impl ModelKind {
@@ -315,7 +315,7 @@ pub fn download_model_cancellable(
     }
     let actual = hex_digest(digest.finalize().as_slice());
     if actual != spec.sha256 {
-        bail!("Google 모델 SHA-256 검증에 실패했습니다.");
+        bail!("{} SHA-256 검증에 실패했습니다.", spec.filename);
     }
     verify_gguf_magic(&temp)?;
     install_without_overwrite(&temp, &target)?;
@@ -332,12 +332,12 @@ pub fn verify_model(path: &Path, kind: ModelKind) -> Result<()> {
         bail!("기호 링크 또는 일반 파일이 아닌 모델은 허용하지 않습니다.");
     }
     if metadata.len() != spec.bytes || metadata.len() > MAX_MODEL_BYTES {
-        bail!("고정된 Google 모델 파일 크기와 일치하지 않습니다.");
+        bail!("{}의 고정 파일 크기와 일치하지 않습니다.", spec.filename);
     }
     verify_gguf_magic(path)?;
     let actual = sha256_file(path)?;
     if actual != spec.sha256 {
-        bail!("Google 모델 SHA-256 검증에 실패했습니다.");
+        bail!("{} SHA-256 검증에 실패했습니다.", spec.filename);
     }
     Ok(())
 }
