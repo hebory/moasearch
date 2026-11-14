@@ -99,6 +99,7 @@ fn main() -> Result<()> {
                 model_id: engine.model_id(),
                 error: None,
                 reader_id: "relevance-fixture".into(),
+                content_key: None,
             }
         })
         .collect();

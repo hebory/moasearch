@@ -1176,6 +1176,7 @@ mod tests {
             model_id: Some(model_id.into()),
             error: None,
             reader_id: "test".into(),
+            content_key: None,
         };
         store.replace_files(&[record]).unwrap();
     }
@@ -1307,6 +1308,7 @@ mod tests {
                 model_id: Some("google-a".into()),
                 error: None,
                 reader_id: "test".into(),
+                content_key: None,
             }])
             .unwrap();
         let search = Search::new(store, Arc::new(FixtureEngine::new("google-a")));
@@ -1363,6 +1365,7 @@ mod tests {
                 model_id: Some("google-a".into()),
                 error: None,
                 reader_id: "test".into(),
+                content_key: None,
             }])
             .unwrap();
         let engine = Arc::new(FixtureEngine::new("google-a"));
@@ -1703,6 +1706,7 @@ mod tests {
                     model_id: None,
                     error: None,
                     reader_id: "test".into(),
+                    content_key: None,
                 },
                 FileRecord {
                     root_id,
@@ -1717,6 +1721,7 @@ mod tests {
                     model_id: None,
                     error: None,
                     reader_id: "test".into(),
+                    content_key: None,
                 },
             ])
             .unwrap();

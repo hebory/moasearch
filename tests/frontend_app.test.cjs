@@ -77,7 +77,7 @@ async function flushAsyncWork() {
 }
 
 function createApp() {
-  const ids = ['root-list','add-root','add-folder-welcome','root-add-dialog','root-add-form','root-add-path','root-add-feedback','root-add-cancel','root-add-submit','root-path-suggestions','rescan-top','quit-app','quit-dialog','cancel-quit','confirm-quit','index-progress','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-ocr','ocr-status','download-progress','download-progress-fill','download-progress-text','folder-scope','folder-scope-path','folder-scope-note','folder-scope-index','folder-scope-clear','toast'];
+  const ids = ['root-list','add-root','add-folder-welcome','root-add-dialog','root-add-form','root-add-path','root-add-feedback','root-add-cancel','root-add-submit','root-path-suggestions','rescan-top','quit-app','quit-dialog','cancel-quit','confirm-quit','index-progress','index-progress-track','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-ocr','ocr-status','download-progress','download-progress-fill','download-progress-text','folder-scope','folder-scope-path','folder-scope-note','folder-scope-index','folder-scope-clear','toast'];
   const elements = new Map(ids.map(id => [id, new Element(id === 'query' ? 'input' : 'div')]));
   const submitButton = new Element('button');
   elements.get('settings-form').submitButton = submitButton;
@@ -136,10 +136,11 @@ function createApp() {
     timers.delete(entry[0]);
     entry[1].handler();
   }
-  function resolveStatus() {
+  function resolveStatus(overrides = {}) {
     call('status')[0].resolve({
       roots: [], counts: { files: 0, chunks: 0, vectors: 0 },
       index: { running: false }, engine: {}, settings: {}, ocr: {}, model_download: {},
+      ...overrides,
     });
   }
   return { elements, calls, call, runTimer, resolveStatus, document, modeButtons };
@@ -152,6 +153,54 @@ function searchResult(id, name) {
 function textTree(node) {
   return [node.textContent || '', ...(node.children || []).map(textTree)].join(' ');
 }
+
+test('shows embedding chunk progress together with files scanned', async () => {
+  const app = createApp();
+  app.resolveStatus({ index: {
+    running: true, phase: 'embedding', scanned: 17, indexed: 4, skipped: 2, errors: 1,
+    current_chunk: 3, total_chunks: 8, current_path: 'D:\\docs\\긴 본문.txt',
+  } });
+  await flushAsyncWork();
+  assert.equal(app.elements.get('index-progress').hidden, false);
+  assert.equal(app.elements.get('index-progress').classList.contains('running'), true);
+  assert.equal(app.elements.get('index-progress-track').hidden, false);
+  assert.equal(app.elements.get('cancel-index').hidden, false);
+  assert.equal(app.elements.get('cancel-index').disabled, false);
+  assert.match(app.elements.get('progress-label').textContent, /3\/8개 본문 조각 분석 중/);
+  assert.match(app.elements.get('progress-detail').textContent, /17개 파일 확인/);
+  assert.match(app.elements.get('progress-detail').textContent, /긴 본문\.txt/);
+});
+
+test('keeps terminal index summaries visible without implying completion on errors or cancellation', async () => {
+  const idle = createApp();
+  idle.resolveStatus();
+  await flushAsyncWork();
+  assert.equal(idle.elements.get('index-progress').hidden, true, 'idle status without a phase stays hidden');
+
+  const cases = [
+    { phase: 'complete', scanned: 24, indexed: 19, skipped: 5, errors: 0, reused: 3, reused_chunks: 22, label: /색인이 완료됐어요/, extra: null },
+    { phase: 'partial', scanned: 24, indexed: 18, skipped: 4, errors: 2, last_error: '두 파일을 읽지 못했습니다.', label: /일부 파일을 읽지 못했어요/, extra: /두 파일을 읽지 못했습니다/ },
+    { phase: 'error', scanned: 7, indexed: 0, skipped: 0, errors: 1, last_error: '디스크 오류', label: /실패했어요/, extra: /디스크 오류/ },
+    { phase: 'cancelled', scanned: 11, indexed: 6, skipped: 1, errors: 0, label: /취소됐어요/, extra: null },
+  ];
+  for (const index of cases) {
+    const app = createApp();
+    const { label, extra, ...status } = index;
+    app.resolveStatus({ index: { running: false, ...status } });
+    await flushAsyncWork();
+    assert.equal(app.elements.get('index-progress').hidden, false, `${index.phase} summary should stay visible`);
+    assert.equal(app.elements.get('index-progress').classList.contains('running'), false);
+    assert.equal(app.elements.get('index-progress').classList.contains('finished'), true);
+    assert.equal(app.elements.get('index-progress-track').hidden, true);
+    assert.equal(app.elements.get('cancel-index').hidden, true);
+    assert.equal(app.elements.get('cancel-index').disabled, true);
+    assert.match(app.elements.get('progress-label').textContent, label);
+    assert.match(app.elements.get('progress-detail').textContent, /확인 \d+개 · 저장 \d+개 · 건너뜀 \d+개 · 오류 \d+개/);
+    if (extra) assert.match(app.elements.get('progress-detail').textContent, extra);
+    if (index.reused !== undefined) assert.match(app.elements.get('progress-detail').textContent, /재사용 3개 파일·22개 조각/);
+    else assert.doesNotMatch(app.elements.get('progress-detail').textContent, /재사용 \d+개 파일/);
+  }
+});
 
 test('disables stale questions immediately and only enables them after the latest search', async () => {
   const app = createApp();

@@ -25,6 +25,14 @@ pub struct FileRecord {
     pub model_id: Option<String>,
     pub error: Option<String>,
     pub reader_id: String,
+    /// Opaque identity for reusing extracted passages and embeddings of equal content.
+    pub content_key: Option<String>,
+}
+
+pub(crate) struct ReusedContent {
+    pub passages: Vec<Passage>,
+    pub vectors: Option<Vec<Vec<f32>>>,
+    pub model_id: Option<String>,
 }
 
 /// The persisted database. Connections are short-lived except while an index
@@ -66,6 +74,10 @@ impl Store {
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  text TEXT NOT NULL, location TEXT NOT NULL, vector BLOB, model_id TEXT);
              CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
+             CREATE TABLE IF NOT EXISTS file_content_keys (
+                 file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                 content_key TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS file_content_keys_key ON file_content_keys(content_key);
              CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                  text, content='chunks', content_rowid='id', tokenize='trigram');
              CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
@@ -326,6 +338,128 @@ impl Store {
         Ok(json!({"files":state["files"],"chunks":state["chunks"],"vectors":state["vectors"]}))
     }
 
+    pub(crate) fn content_key_on(db: &Connection, file_id: i64) -> Result<Option<String>> {
+        Ok(db
+            .query_row(
+                "SELECT content_key FROM file_content_keys WHERE file_id=?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn set_content_key_on(
+        db: &Connection,
+        file_id: i64,
+        key: &str,
+        expected: &Value,
+    ) -> Result<()> {
+        let Some(model_value) = expected.get("model_id") else {
+            return Ok(());
+        };
+        if !model_value.is_null() && !model_value.is_string() {
+            return Ok(());
+        }
+        let model_id = model_value.as_str();
+        let (Some(size), Some(modified), Some(reader_id)) = (
+            expected.get("size").and_then(Value::as_i64),
+            expected.get("modified").and_then(Value::as_i64),
+            expected.get("reader_id").and_then(Value::as_str),
+        ) else {
+            return Ok(());
+        };
+        db.execute(
+            "INSERT INTO file_content_keys(file_id,content_key)
+             SELECT id,?2 FROM files WHERE id=?1 AND size=?3 AND modified=?4
+                 AND reader_id=?5 AND model_id IS ?6
+                 AND status IN ('content','metadata') AND error IS NULL
+             ON CONFLICT(file_id) DO UPDATE SET content_key=excluded.content_key",
+            params![file_id, key, size, modified, reader_id, model_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn reusable_content_on(db: &Connection, key: &str) -> Result<Option<ReusedContent>> {
+        let mut stmt = db.prepare(
+            "WITH candidate AS (
+                 SELECT f.id,f.model_id FROM file_content_keys k
+                 JOIN files f ON f.id=k.file_id
+                 WHERE k.content_key=?1 AND f.status IN ('content','metadata') AND f.error IS NULL
+                 ORDER BY f.id LIMIT 1
+             )
+             SELECT candidate.id,candidate.model_id,c.id,c.text,c.location,c.vector,c.model_id
+             FROM candidate LEFT JOIN chunks c ON c.file_id=candidate.id ORDER BY c.id",
+        )?;
+        let rows = stmt
+            .query_map([key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((_, model_id, _, _, _, _, _)) = rows.first() else {
+            return Ok(None);
+        };
+        let model_id = (*model_id).clone();
+        let mut passages = Vec::with_capacity(rows.len());
+        let mut vectors = Vec::with_capacity(rows.len());
+        let mut vector_count = 0usize;
+        for (_, _, chunk_id, text, location, raw, chunk_model_id) in rows {
+            let Some(_chunk_id) = chunk_id else {
+                continue;
+            };
+            let (Some(text), Some(location)) = (text, location) else {
+                return Ok(None);
+            };
+            let passage = Passage { text, location };
+            passages.push(passage);
+            if let Some(raw) = raw {
+                if model_id.is_none() || chunk_model_id.as_deref() != model_id.as_deref() {
+                    return Ok(None);
+                }
+                let Some(vector) = decode_vector(&raw) else {
+                    return Ok(None);
+                };
+                vector_count += 1;
+                vectors.push(vector);
+            }
+        }
+        let vectors = if vector_count == 0 {
+            None
+        } else {
+            if vector_count != passages.len() || vectors.len() != passages.len() {
+                return Ok(None);
+            }
+            let dimension = vectors.first().map(Vec::len).unwrap_or(0);
+            if dimension == 0
+                || vectors.iter().any(|v| {
+                    let norm_squared = v.iter().map(|value| value * value).sum::<f32>();
+                    v.len() != dimension
+                        || v.iter().any(|value| !value.is_finite())
+                        || !norm_squared.is_finite()
+                        || norm_squared <= f32::EPSILON
+                })
+            {
+                return Ok(None);
+            }
+            Some(vectors)
+        };
+        if !passages.is_empty() && model_id.is_some() && vectors.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ReusedContent {
+            passages,
+            vectors,
+            model_id,
+        }))
+    }
+
     pub fn file_by_path(&self, path: &Path) -> Result<Option<Value>> {
         Self::file_by_path_on(&self.connect()?, path)
     }
@@ -458,6 +592,19 @@ fn replace_one(db: &Connection, record: &FileRecord) -> Result<()> {
             params![file_id, passage.text, passage.location, vector, model_id],
         )?;
     }
+    if record.error.is_none() {
+        if let Some(key) = &record.content_key {
+            db.execute(
+                "INSERT INTO file_content_keys(file_id,content_key) VALUES (?1,?2)
+                 ON CONFLICT(file_id) DO UPDATE SET content_key=excluded.content_key",
+                params![file_id, key],
+            )?;
+        } else {
+            db.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+        }
+    } else {
+        db.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+    }
     Ok(())
 }
 
@@ -547,6 +694,7 @@ mod tests {
             model_id: Some("google-test".into()),
             error: None,
             reader_id: "reader-v2".into(),
+            content_key: None,
         };
         store.replace_files(&[record]).unwrap();
         assert_eq!(
@@ -629,6 +777,7 @@ mod tests {
             model_id: Some("google-fixture".into()),
             error: None,
             reader_id: "test".into(),
+            content_key: None,
         };
         let before = store.index_state().unwrap();
         assert!(store.replace_files(&[record]).is_err());
@@ -650,6 +799,298 @@ mod tests {
             .optional()
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn reusable_content_returns_all_passages_and_validated_vectors() {
+        let temp = test_tempdir("store-reuse-payload-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(library.to_str().unwrap()).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let passages: Vec<_> = (0..105)
+            .map(|i| Passage {
+                text: format!("본문 조각 {i}"),
+                location: format!("페이지 {i}"),
+            })
+            .collect();
+        let vectors = vec![vec![0.25, 0.75]; passages.len()];
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path: library.join("original.txt"),
+                size: 10,
+                modified: 1,
+                passages: passages.clone(),
+                vectors: Some(vectors.clone()),
+                model_id: Some("embedding-fixture".into()),
+                error: None,
+                reader_id: "reader-v2".into(),
+                content_key: Some("opaque-key".into()),
+            }])
+            .unwrap();
+
+        let db = store.connect().unwrap();
+        let file_id: i64 = db
+            .query_row(
+                "SELECT id FROM files WHERE path=?1",
+                [library.join("original.txt").to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Store::content_key_on(&db, file_id).unwrap().as_deref(),
+            Some("opaque-key")
+        );
+        let cached = Store::reusable_content_on(&db, "opaque-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.passages.len(), 105);
+        assert_eq!(cached.passages, passages);
+        assert_eq!(cached.vectors.unwrap(), vectors);
+        assert_eq!(cached.model_id.as_deref(), Some("embedding-fixture"));
+        assert!(
+            Store::reusable_content_on(&db, "missing-key")
+                .unwrap()
+                .is_none()
+        );
+        db.execute(
+            "UPDATE chunks SET vector=?1 WHERE file_id=?2 AND id=(
+                SELECT min(id) FROM chunks WHERE file_id=?2)",
+            params![encode_vector(&[f32::NAN, 1.0]), file_id],
+        )
+        .unwrap();
+        assert!(
+            Store::reusable_content_on(&db, "opaque-key")
+                .unwrap()
+                .is_none()
+        );
+        db.execute(
+            "UPDATE chunks SET vector=?1,model_id='different-model'
+             WHERE file_id=?2 AND id=(SELECT min(id) FROM chunks WHERE file_id=?2)",
+            params![encode_vector(&[1.0, 0.0]), file_id],
+        )
+        .unwrap();
+        assert!(
+            Store::reusable_content_on(&db, "opaque-key")
+                .unwrap()
+                .is_none()
+        );
+        db.execute(
+            "UPDATE chunks SET vector=?1,model_id='embedding-fixture'
+             WHERE file_id=?2 AND id=(SELECT min(id) FROM chunks WHERE file_id=?2)",
+            params![encode_vector(&[0.0, 0.0]), file_id],
+        )
+        .unwrap();
+        assert!(
+            Store::reusable_content_on(&db, "opaque-key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_vectors_when_file_declares_embedding_model() {
+        let temp = test_tempdir("store-reuse-missing-vector-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(library.to_str().unwrap()).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path: library.join("embedded.txt"),
+                size: 4,
+                modified: 1,
+                passages: vec![Passage {
+                    text: "body".into(),
+                    location: "본문".into(),
+                }],
+                vectors: Some(vec![vec![0.5, 0.5]]),
+                model_id: Some("embedding-fixture".into()),
+                error: None,
+                reader_id: "reader-v2".into(),
+                content_key: Some("embedded-key".into()),
+            }])
+            .unwrap();
+        let db = store.connect().unwrap();
+        db.execute("UPDATE chunks SET vector=NULL", []).unwrap();
+        assert!(
+            Store::reusable_content_on(&db, "embedded-key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_expected_metadata_cannot_attach_a_legacy_content_key() {
+        let temp = test_tempdir("store-reuse-stale-backfill-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(library.to_str().unwrap()).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let path = library.join("backfill.txt");
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path: path.clone(),
+                size: 4,
+                modified: 10,
+                passages: vec![Passage {
+                    text: "body".into(),
+                    location: "본문".into(),
+                }],
+                vectors: None,
+                model_id: None,
+                error: None,
+                reader_id: "reader-v2".into(),
+                content_key: None,
+            }])
+            .unwrap();
+        let db = store.connect().unwrap();
+        let expected = Store::file_by_path_on(&db, &path).unwrap().unwrap();
+        let file_id = expected["id"].as_i64().unwrap();
+        db.execute(
+            "UPDATE files SET modified=modified+1 WHERE id=?1",
+            [file_id],
+        )
+        .unwrap();
+
+        Store::set_content_key_on(&db, file_id, "stale-key", &expected).unwrap();
+        assert_eq!(Store::content_key_on(&db, file_id).unwrap(), None);
+        let fresh = Store::file_by_path_on(&db, &path).unwrap().unwrap();
+        Store::set_content_key_on(&db, file_id, "fresh-key", &fresh).unwrap();
+        assert_eq!(
+            Store::content_key_on(&db, file_id).unwrap().as_deref(),
+            Some("fresh-key")
+        );
+    }
+
+    #[test]
+    fn replacement_without_valid_key_and_error_replacement_invalidate_cache() {
+        let temp = test_tempdir("store-reuse-invalidate-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(library.to_str().unwrap()).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let make_record = |key: Option<&str>, error: Option<&str>| FileRecord {
+            root_id,
+            path: library.join("copy.txt"),
+            size: 4,
+            modified: 1,
+            passages: vec![Passage {
+                text: "same body".into(),
+                location: "body".into(),
+            }],
+            vectors: None,
+            model_id: None,
+            error: error.map(str::to_owned),
+            reader_id: "reader-v2".into(),
+            content_key: key.map(str::to_owned),
+        };
+        store
+            .replace_files(&[make_record(Some("cached"), None)])
+            .unwrap();
+        let db = store.connect().unwrap();
+        let file_id: i64 = db
+            .query_row("SELECT id FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            Store::content_key_on(&db, file_id).unwrap().as_deref(),
+            Some("cached")
+        );
+        let keyword_only = Store::reusable_content_on(&db, "cached").unwrap().unwrap();
+        assert!(keyword_only.vectors.is_none());
+        assert_eq!(keyword_only.passages.len(), 1);
+        drop(db);
+
+        store.replace_files(&[make_record(None, None)]).unwrap();
+        let db = store.connect().unwrap();
+        assert_eq!(Store::content_key_on(&db, file_id).unwrap(), None);
+        drop(db);
+        store
+            .replace_files(&[make_record(Some("must-not-cache"), Some("reader failed"))])
+            .unwrap();
+        let db = store.connect().unwrap();
+        assert_eq!(Store::content_key_on(&db, file_id).unwrap(), None);
+        assert!(
+            Store::reusable_content_on(&db, "must-not-cache")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_updates_rollback_with_file_batch_and_prune_cascades_key() {
+        let temp = test_tempdir("store-reuse-atomic-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(library.to_str().unwrap()).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let valid = FileRecord {
+            root_id,
+            path: library.join("atomic.txt"),
+            size: 1,
+            modified: 1,
+            passages: vec![Passage {
+                text: "original".into(),
+                location: "body".into(),
+            }],
+            vectors: None,
+            model_id: None,
+            error: None,
+            reader_id: "reader-v2".into(),
+            content_key: Some("old-key".into()),
+        };
+        store.replace_files(&[valid.clone()]).unwrap();
+        let mut bad = valid.clone();
+        bad.path = library.join("bad.txt");
+        bad.vectors = Some(Vec::new());
+        bad.content_key = Some("bad-key".into());
+        let mut replacement = valid.clone();
+        replacement.passages[0].text = "uncommitted replacement".into();
+        replacement.content_key = Some("new-key".into());
+        assert!(store.replace_files(&[replacement, bad]).is_err());
+        let db = store.connect().unwrap();
+        let file_id: i64 = db
+            .query_row(
+                "SELECT id FROM files WHERE path=?1",
+                [valid.path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Store::content_key_on(&db, file_id).unwrap().as_deref(),
+            Some("old-key")
+        );
+        assert_eq!(
+            Store::reusable_content_on(&db, "old-key")
+                .unwrap()
+                .unwrap()
+                .passages[0]
+                .text,
+            "original"
+        );
+        drop(db);
+
+        store.prune(root_id, &HashSet::new()).unwrap();
+        let db = store.connect().unwrap();
+        assert_eq!(Store::content_key_on(&db, file_id).unwrap(), None);
+        assert!(
+            Store::reusable_content_on(&db, "old-key")
+                .unwrap()
+                .is_none()
         );
     }
 }
