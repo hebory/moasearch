@@ -16,6 +16,7 @@ use crate::store::{Store, decode_vector};
 
 const DEFAULT_VECTOR_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const QUERY_CACHE_SIZE: usize = 64;
+const LEXICAL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 // Conservative defaults evaluated with the pinned EmbeddingGemma 2 Q8_0.
 // Cosine is a model-specific ranking signal, not a probability of relevance.
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.70;
@@ -311,11 +312,116 @@ impl QueryCache {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct LexicalKey {
+    terms: Vec<String>,
+    extension: Option<String>,
+    folder: Option<PathBuf>,
+    source_code: bool,
+}
+
+#[derive(Clone)]
+struct LexicalHits {
+    hits: HashMap<i64, Hit>,
+    next_order: usize,
+}
+
+struct LexicalEntry {
+    key: LexicalKey,
+    value: Arc<LexicalHits>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct LexicalCache {
+    revision: Option<i64>,
+    entries: Vec<LexicalEntry>,
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl LexicalCache {
+    fn get(&mut self, revision: i64, key: &LexicalKey) -> Option<Arc<LexicalHits>> {
+        if self.revision != Some(revision) {
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(index);
+        let result = entry.value.clone();
+        self.entries.insert(0, entry);
+        #[cfg(test)]
+        {
+            self.hits += 1;
+        }
+        Some(result)
+    }
+
+    fn insert(
+        &mut self,
+        revision: i64,
+        key: LexicalKey,
+        value: Arc<LexicalHits>,
+        bytes: usize,
+        limit: usize,
+    ) {
+        // An older concurrent read must not evict a newer snapshot.
+        if self.revision.is_some_and(|current| current > revision) {
+            return;
+        }
+        if self.revision != Some(revision) {
+            self.entries.clear();
+            self.bytes = 0;
+            self.revision = Some(revision);
+        }
+        if bytes > limit {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.bytes -= self.entries.remove(index).bytes;
+        }
+        while self.bytes.saturating_add(bytes) > limit || self.entries.len() >= QUERY_CACHE_SIZE {
+            let Some(removed) = self.entries.pop() else {
+                break;
+            };
+            self.bytes -= removed.bytes;
+        }
+        self.bytes += bytes;
+        self.entries.insert(0, LexicalEntry { key, value, bytes });
+    }
+}
+
+fn lexical_bytes(key: &LexicalKey, value: &LexicalHits) -> usize {
+    let key_bytes = key
+        .terms
+        .iter()
+        .map(|s| s.len().saturating_mul(2) + 32)
+        .sum::<usize>()
+        + key
+            .extension
+            .as_ref()
+            .map_or(0, |s| s.len().saturating_mul(2))
+        + key
+            .folder
+            .as_ref()
+            .map_or(0, |s| s.as_os_str().len().saturating_mul(2));
+    value
+        .hits
+        .values()
+        .fold(key_bytes.saturating_add(128), |total, hit| {
+            total
+                .saturating_add(hit.file.to_string().len())
+                .saturating_add(hit.text.as_ref().map_or(0, String::len))
+                .saturating_add(1024)
+        })
+}
+
 pub struct Search {
     store: Arc<Store>,
     engine: Arc<dyn Embedder>,
     vectors: Mutex<VectorCache>,
     query_vectors: Mutex<QueryCache>,
+    lexical: Mutex<LexicalCache>,
     vector_cache_bytes: usize,
 }
 
@@ -334,6 +440,7 @@ impl Search {
             engine,
             vectors: Mutex::new(VectorCache::default()),
             query_vectors: Mutex::new(QueryCache::default()),
+            lexical: Mutex::new(LexicalCache::default()),
             vector_cache_bytes,
         }
     }
@@ -399,41 +506,15 @@ impl Search {
         let extension = extension
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!(".{}", value.trim().trim_start_matches('.').to_lowercase()));
-        let mut hits = HashMap::<i64, Hit>::new();
+        let lexical = self.lexical_hits(LexicalKey {
+            terms: keyword_terms,
+            extension: extension.clone(),
+            folder: folder.map(Path::to_path_buf),
+            source_code: source_code_intent,
+        })?;
+        let mut hits = lexical.hits;
+        let mut next_hit_order = lexical.next_order;
         let mut warnings = Vec::<String>::new();
-        let mut next_hit_order = 0usize;
-        {
-            let db = self.store.connect()?;
-            keyword_search(
-                &db,
-                &keyword_terms,
-                extension.as_deref(),
-                folder,
-                &mut hits,
-                &mut next_hit_order,
-            )?;
-            if source_code_intent {
-                for (rank, mut file) in
-                    intent::source_code_files(&db, extension.as_deref(), folder)?
-                        .into_iter()
-                        .enumerate()
-                {
-                    let text = file
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("text")
-                        .and_then(|text| text.as_str().map(str::to_string));
-                    add_hit(
-                        &mut hits,
-                        file,
-                        text,
-                        rank + 1,
-                        "filetype",
-                        &mut next_hit_order,
-                    );
-                }
-            }
-        }
 
         let mut actual_mode = "keyword";
         if mode == "hybrid" && !source_code_intent {
@@ -504,6 +585,61 @@ impl Search {
         Ok(
             json!({"results":output,"mode":if source_code_intent {"hybrid"} else {actual_mode},"intent":if source_code_intent {Some("source_code")} else {None},"warnings":warnings}),
         )
+    }
+
+    fn lexical_hits(&self, key: LexicalKey) -> Result<LexicalHits> {
+        let mut db = self.store.connect()?;
+        let tx = db.transaction()?;
+        let revision = Store::lexical_revision_on(&tx)?;
+        let cached = self.lexical.lock().unwrap().get(revision, &key);
+        if let Some(cached) = cached {
+            tx.commit()?;
+            return Ok((*cached).clone());
+        }
+        let mut value = LexicalHits {
+            hits: HashMap::new(),
+            next_order: 0,
+        };
+        keyword_search(
+            &tx,
+            &key.terms,
+            key.extension.as_deref(),
+            key.folder.as_deref(),
+            &mut value.hits,
+            &mut value.next_order,
+        )?;
+        if key.source_code {
+            for (rank, mut file) in
+                intent::source_code_files(&tx, key.extension.as_deref(), key.folder.as_deref())?
+                    .into_iter()
+                    .enumerate()
+            {
+                let text = file
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("text")
+                    .and_then(|text| text.as_str().map(str::to_string));
+                add_hit(
+                    &mut value.hits,
+                    file,
+                    text,
+                    rank + 1,
+                    "filetype",
+                    &mut value.next_order,
+                );
+            }
+        }
+        tx.commit()?;
+        // Accounting and deep copies stay outside the cache mutex. Only the
+        // lexical revision invalidates this cache; background vector updates
+        // keep instant and semantic requests on the same lexical snapshot.
+        let bytes = lexical_bytes(&key, &value);
+        let cached = Arc::new(value.clone());
+        self.lexical
+            .lock()
+            .unwrap()
+            .insert(revision, key, cached, bytes, LEXICAL_CACHE_BYTES);
+        Ok(value)
     }
 
     pub fn answer(&self, query: &str, limit: usize) -> Result<Value> {
@@ -646,6 +782,7 @@ fn semantic_minimum(best: Option<f32>) -> f32 {
     })
 }
 
+#[derive(Clone)]
 struct Hit {
     file: Value,
     text: Option<String>,
@@ -1433,6 +1570,120 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn lexical_cache_keeps_vector_updates_fast_and_invalidates_changed_content() {
+        let (_temp, store, library, root_id) = fixture();
+        add_document(
+            &store,
+            &library,
+            root_id,
+            "needle.txt",
+            vec![vec![1.0, 0.0]],
+            "google-a",
+        );
+        let search = Search::new(store.clone(), Arc::new(FixtureEngine::new("google-a")));
+        assert_eq!(
+            search.search("fixture", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let db = store.connect().unwrap();
+        let lexical_revision = Store::lexical_revision_on(&db).unwrap();
+        let revision = store.index_state().unwrap()["revision"].as_i64().unwrap();
+        db.execute("UPDATE chunks SET vector=x'000000000000803f'", [])
+            .unwrap();
+        assert_eq!(Store::lexical_revision_on(&db).unwrap(), lexical_revision);
+        assert!(store.index_state().unwrap()["revision"].as_i64().unwrap() > revision);
+        search.search("fixture", 10, None, "hybrid").unwrap();
+        assert_eq!(search.lexical.lock().unwrap().hits, 1);
+
+        db.execute("UPDATE chunks SET text='freshword'", [])
+            .unwrap();
+        assert!(
+            search.search("fixture", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            search.search("freshword", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::rename(library.join("needle.txt"), library.join("new-title.txt")).unwrap();
+        db.execute(
+            "UPDATE files SET path=?1,name='new-title.txt'",
+            [crate::config::canonical(&library.join("new-title.txt"))
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()],
+        )
+        .unwrap();
+        assert!(
+            search.search("needle", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            search.search("new-title", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        store.remove_root(root_id).unwrap();
+        assert!(
+            search.search("new-title", 10, None, "instant").unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lexical_cache_bounds_memory_and_ignores_late_older_snapshots() {
+        let key = |term: &str| LexicalKey {
+            terms: vec![term.into()],
+            extension: None,
+            folder: None,
+            source_code: false,
+        };
+        let value = Arc::new(LexicalHits {
+            hits: HashMap::from([(
+                1,
+                Hit {
+                    file: json!({"id":1,"path":"a.txt"}),
+                    text: Some("body".into()),
+                    score: 0.0,
+                    match_type: "keyword".into(),
+                    first_seen: 0,
+                },
+            )]),
+            next_order: 1,
+        });
+        let bytes = lexical_bytes(&key("a"), &value);
+        let limit = bytes * 2;
+        let mut cache = LexicalCache::default();
+        for term in ["a", "b", "c"] {
+            cache.insert(1, key(term), value.clone(), bytes, limit);
+        }
+        assert!(cache.bytes <= limit);
+        assert!(cache.get(1, &key("a")).is_none());
+        assert!(cache.get(1, &key("b")).is_some());
+        cache.insert(2, key("b"), value.clone(), bytes, limit);
+        cache.insert(1, key("a"), value.clone(), bytes, limit);
+        assert!(cache.get(2, &key("b")).is_some());
+        assert!(cache.get(1, &key("a")).is_none());
+        cache.insert(2, key("c"), value, limit + 1, limit);
+        assert!(cache.get(2, &key("c")).is_none());
+        assert!(cache.bytes <= limit);
     }
 
     #[test]

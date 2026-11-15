@@ -135,6 +135,11 @@ impl Store {
              END;
              CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
                  INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_text_au AFTER UPDATE OF text ON chunks
+             WHEN old.text IS NOT new.text BEGIN
+                 INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text);
+                 INSERT INTO chunks_fts(rowid,text) VALUES(new.id,new.text);
              END;",
         )?;
         let columns = {
@@ -288,6 +293,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS index_meta (
                  id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,
                  files INTEGER NOT NULL, chunks INTEGER NOT NULL, vectors INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS lexical_meta (
+                 id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+             INSERT OR IGNORE INTO lexical_meta(id,revision) VALUES(1,0);
              INSERT INTO index_meta SELECT 1,0,
                  (SELECT count(*) FROM files), (SELECT count(*) FROM chunks),
                  (SELECT count(*) FROM chunks WHERE vector IS NOT NULL)
@@ -303,6 +311,21 @@ impl Store {
              CREATE TRIGGER IF NOT EXISTS files_search_au AFTER UPDATE ON files BEGIN
                  UPDATE index_meta SET revision=revision+1 WHERE id=1;
              END;
+             CREATE TRIGGER IF NOT EXISTS files_lexical_ai AFTER INSERT ON files BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS files_lexical_ad AFTER DELETE ON files BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS files_lexical_au
+             AFTER UPDATE OF root_id,path,name,extension,size,modified,status,error,reader_id ON files
+             WHEN old.root_id IS NOT new.root_id OR old.path IS NOT new.path
+               OR old.name IS NOT new.name OR old.extension IS NOT new.extension
+               OR old.size IS NOT new.size OR old.modified IS NOT new.modified
+               OR old.status IS NOT new.status OR old.error IS NOT new.error
+               OR old.reader_id IS NOT new.reader_id BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
              CREATE TRIGGER IF NOT EXISTS files_path_au AFTER UPDATE OF path ON files
              WHEN old.path != new.path BEGIN
                  INSERT INTO files_fts(files_fts,rowid,path) VALUES('delete',old.id,old.path);
@@ -315,6 +338,18 @@ impl Store {
              CREATE TRIGGER IF NOT EXISTS chunks_meta_ad AFTER DELETE ON chunks BEGIN
                  UPDATE index_meta SET revision=revision+1,chunks=chunks-1,
                      vectors=vectors-(old.vector IS NOT NULL) WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_lexical_ai AFTER INSERT ON chunks BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_lexical_ad AFTER DELETE ON chunks BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_lexical_au
+             AFTER UPDATE OF file_id,text,location ON chunks
+             WHEN old.file_id IS NOT new.file_id OR old.text IS NOT new.text
+               OR old.location IS NOT new.location BEGIN
+                 UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
              END;
              CREATE TRIGGER IF NOT EXISTS chunks_meta_au AFTER UPDATE ON chunks BEGIN
                  UPDATE index_meta SET revision=revision+1,
@@ -534,6 +569,14 @@ impl Store {
             },
         )?;
         Ok(json!({"revision":revision,"files":files,"chunks":chunks,"vectors":vectors}))
+    }
+
+    pub(crate) fn lexical_revision_on(db: &Connection) -> Result<i64> {
+        Ok(
+            db.query_row("SELECT revision FROM lexical_meta WHERE id=1", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
     pub fn counts(&self) -> Result<Value> {
@@ -1440,6 +1483,87 @@ mod tests {
             json!({"files":0,"chunks":0,"vectors":0})
         );
         assert!(store.index_state().unwrap()["revision"].as_i64().unwrap() > before);
+    }
+
+    #[test]
+    fn lexical_revision_tracks_searchable_changes_but_ignores_vectors() {
+        let temp = test_tempdir("store-lexical-revision-");
+        let library = temp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let path = library.join("note.txt");
+        std::fs::write(&path, "memo").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let root_id = store.add_root(&library).unwrap()["id"].as_i64().unwrap();
+        store
+            .replace_files(&[FileRecord {
+                root_id,
+                path: path.clone(),
+                size: metadata.len() as i64,
+                modified: crate::config::modified_ns(&metadata),
+                passages: vec![Passage {
+                    text: "memo body".into(),
+                    location: "본문".into(),
+                }],
+                vectors: Some(vec![vec![1.0, 0.0]]),
+                model_id: Some("google-test".into()),
+                error: None,
+                reader_id: "reader-v1".into(),
+                content_key: None,
+            }])
+            .unwrap();
+
+        let mut db = store.connect().unwrap();
+        let after_insert = Store::lexical_revision_on(&db).unwrap();
+        assert!(after_insert > 0);
+        let record = InventoryRecord {
+            root_id,
+            path: path.clone(),
+            size: metadata.len() as i64,
+            modified: crate::config::modified_ns(&metadata),
+            reader_id: "reader-v1".into(),
+        };
+        Store::inventory_files_on(&mut db, &[record]).unwrap();
+        assert_eq!(Store::lexical_revision_on(&db).unwrap(), after_insert);
+
+        let global_before_vectors = Store::index_state_on(&db).unwrap()["revision"]
+            .as_i64()
+            .unwrap();
+        db.execute("UPDATE files SET model_id='google-next'", [])
+            .unwrap();
+        db.execute(
+            "UPDATE chunks SET vector=x'0000803f00000000',model_id='google-next'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(Store::lexical_revision_on(&db).unwrap(), after_insert);
+        assert!(
+            Store::index_state_on(&db).unwrap()["revision"]
+                .as_i64()
+                .unwrap()
+                > global_before_vectors
+        );
+
+        db.execute("UPDATE files SET name='renamed.txt'", [])
+            .unwrap();
+        let after_filename = Store::lexical_revision_on(&db).unwrap();
+        assert_eq!(after_filename, after_insert + 1);
+        db.execute("UPDATE chunks SET text='updated body'", [])
+            .unwrap();
+        let after_text = Store::lexical_revision_on(&db).unwrap();
+        assert_eq!(after_text, after_filename + 1);
+
+        let before_rollback = after_text;
+        let tx = db.transaction().unwrap();
+        tx.execute("UPDATE files SET status='metadata'", [])
+            .unwrap();
+        tx.execute("UPDATE chunks SET location='다른 위치'", [])
+            .unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(Store::lexical_revision_on(&db).unwrap(), before_rollback);
+        drop(db);
+        store.remove_root(root_id).unwrap();
+        assert!(Store::lexical_revision_on(&store.connect().unwrap()).unwrap() > before_rollback);
     }
 
     #[test]
