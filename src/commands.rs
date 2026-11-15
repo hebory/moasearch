@@ -20,11 +20,77 @@ pub struct SearchInput {
     pub folder: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFilesInput {
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
+    #[serde(default)]
+    pub cursor: Option<ListCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListCursor {
+    pub name: String,
+    pub path: PathBuf,
+    pub id: i64,
+    pub revision: i64,
+}
+
+fn default_list_limit() -> usize {
+    200
+}
+
 fn default_limit() -> usize {
     30
 }
 fn default_mode() -> String {
     "hybrid".into()
+}
+
+impl ListFilesInput {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=500).contains(&self.limit),
+            "파일 목록 개수는 1~500개여야 합니다."
+        );
+        if let Some(extension) = self.extension.as_deref() {
+            let normalized = extension.trim().trim_start_matches('.');
+            anyhow::ensure!(
+                extension.trim().is_empty()
+                    || (!normalized.is_empty()
+                        && normalized.len() <= 30
+                        && normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+                "확장자 형식이 올바르지 않습니다."
+            );
+        }
+        if let Some(folder) = &self.folder {
+            let path = folder.to_string_lossy();
+            anyhow::ensure!(
+                !path.trim().is_empty() && path.chars().count() <= 32767 && !path.contains('\0'),
+                "폴더 경로가 올바르지 않습니다."
+            );
+        }
+        if let Some(cursor) = &self.cursor {
+            let path = cursor.path.to_string_lossy();
+            anyhow::ensure!(
+                !cursor.name.is_empty()
+                    && cursor.name.chars().count() <= 255
+                    && !path.is_empty()
+                    && path.chars().count() <= 32767
+                    && !path.contains('\0')
+                    && cursor.id > 0
+                    && cursor.revision >= 0,
+                "파일 목록 cursor가 올바르지 않습니다."
+            );
+        }
+        Ok(())
+    }
 }
 
 impl SearchInput {
@@ -65,6 +131,7 @@ pub enum Command {
     CancelIndex {},
     UpdateSettings { settings: Value },
     Search(SearchInput),
+    ListFiles(ListFilesInput),
     Answer(SearchInput),
     File { id: i64 },
     OpenFile { id: i64 },

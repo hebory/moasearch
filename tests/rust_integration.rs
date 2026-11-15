@@ -1,6 +1,6 @@
 use anyhow::Result;
 use moasearch::{
-    commands::SearchInput,
+    commands::{Command, ListFilesInput, SearchInput},
     config,
     engine::{EmbeddedEngine, Embedder},
     indexer::Indexer,
@@ -26,6 +26,176 @@ fn scratch() -> Result<tempfile::TempDir> {
     let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".moasearch-tests");
     std::fs::create_dir_all(&parent)?;
     Ok(tempfile::tempdir_in(parent)?)
+}
+
+#[test]
+fn metadata_file_listing_paginates_and_resets_only_for_list_changes() -> Result<()> {
+    let defaults: ListFilesInput = serde_json::from_value(json!({}))?;
+    assert_eq!(defaults.limit, 200);
+    defaults.validate()?;
+    let mut invalid = defaults.clone();
+    invalid.limit = 501;
+    assert!(invalid.validate().is_err());
+    invalid.limit = 20;
+    invalid.extension = Some(".".into());
+    assert!(invalid.validate().is_err());
+    let dir = scratch()?;
+    let root = dir.path().join("목록");
+    for relative in [
+        "docs/sub",
+        "docs-extra",
+        "Docs",
+        "docs%_special",
+        "docs%_special-other",
+    ] {
+        std::fs::create_dir_all(root.join(relative))?;
+    }
+    let store = Arc::new(Store::open(dir.path().join("data"))?);
+    let root_id = store.add_root(&root)?["id"].as_i64().unwrap();
+    let files = [
+        ("docs/a.txt", "a.txt", ".txt"),
+        ("docs/sub/b.txt", "b.txt", ".txt"),
+        ("docs-extra/c.pdf", "c.pdf", ".pdf"),
+        ("Docs/f.txt", "f.txt", ".txt"),
+        ("docs%_special/d.txt", "d.txt", ".txt"),
+        ("docs%_special-other/e.txt", "e.txt", ".txt"),
+    ];
+    let db = store.connect()?;
+    for (index, (relative, name, extension)) in files.iter().enumerate() {
+        let path = root.join(relative);
+        std::fs::write(&path, b"x")?;
+        let path = config::canonical(&path)?;
+        db.execute(
+            "INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id,reader_id)
+             VALUES(?1,?2,?3,?4,1,?5,'complete',NULL,NULL,'test-v1')",
+            rusqlite::params![
+                root_id,
+                path.to_string_lossy().as_ref(),
+                name,
+                extension,
+                index as i64,
+            ],
+        )?;
+        if index == 0 {
+            let file_id = db.last_insert_rowid();
+            db.execute(
+                "INSERT INTO chunks(file_id,text,location,vector,model_id)
+                 VALUES(?1,'본문을 목록에 싣지 않습니다.','',NULL,NULL)",
+                [file_id],
+            )?;
+        }
+    }
+    drop(db);
+
+    let services = AppServices::new(store.clone(), Arc::new(EmbeddedEngine::new(store.clone())));
+    let first = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 2,
+        extension: None,
+        folder: None,
+        cursor: None,
+    }))?;
+    assert_eq!(first["total"], 6);
+    assert_eq!(first["results"].as_array().unwrap().len(), 2);
+    assert_eq!(first["reset_required"], false);
+    assert!(first["results"][0].get("text").is_none());
+    let cursor: moasearch::commands::ListCursor =
+        serde_json::from_value(first["next_cursor"].clone())?;
+
+    let stable_revision = first["revision"].as_i64().unwrap();
+    assert_eq!(
+        services.execute(Command::Status {})?["list_revision"],
+        stable_revision
+    );
+    let db = store.connect()?;
+    db.execute("UPDATE files SET status='pending' WHERE name='a.txt'", [])?;
+    db.execute(
+        "UPDATE chunks SET vector=?1,model_id='fixture-google' WHERE file_id=(SELECT id FROM files WHERE name='a.txt')",
+        rusqlite::params![vec![0_u8; 12]],
+    )?;
+    drop(db);
+    assert_eq!(store.list_revision()?, stable_revision);
+    let second = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 2,
+        extension: None,
+        folder: None,
+        cursor: Some(cursor.clone()),
+    }))?;
+    assert_eq!(second["reset_required"], false);
+    assert_eq!(second["results"].as_array().unwrap().len(), 2);
+    let third_cursor: moasearch::commands::ListCursor =
+        serde_json::from_value(second["next_cursor"].clone())?;
+    let third = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 2,
+        extension: None,
+        folder: None,
+        cursor: Some(third_cursor),
+    }))?;
+    assert_eq!(third["results"].as_array().unwrap().len(), 2);
+    assert!(third["next_cursor"].is_null());
+    let first_ids = first["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["id"].as_i64().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        second["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| { !first_ids.contains(&file["id"].as_i64().unwrap()) })
+    );
+    assert!(third["results"].as_array().unwrap().iter().all(|file| {
+        !first_ids.contains(&file["id"].as_i64().unwrap())
+            && !second["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|prior| prior["id"] == file["id"])
+    }));
+
+    let scoped = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 20,
+        extension: Some("TXT".into()),
+        folder: Some(root.join("docs%_special")),
+        cursor: None,
+    }))?;
+    assert_eq!(scoped["total"], 1);
+    assert_eq!(scoped["results"][0]["name"], "d.txt");
+    let case_scoped = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 20,
+        extension: None,
+        folder: Some(root.join("docs")),
+        cursor: None,
+    }))?;
+    #[cfg(windows)]
+    assert_eq!(case_scoped["total"], 3);
+    #[cfg(not(windows))]
+    {
+        assert_eq!(case_scoped["total"], 2);
+        assert!(
+            case_scoped["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["name"] != "f.txt")
+        );
+    }
+
+    let db = store.connect()?;
+    db.execute("UPDATE files SET name='renamed.txt' WHERE name='e.txt'", [])?;
+    drop(db);
+    let stale = services.execute(Command::ListFiles(ListFilesInput {
+        limit: 2,
+        extension: None,
+        folder: None,
+        cursor: Some(cursor),
+    }))?;
+    assert_eq!(stale["reset_required"], true);
+    assert_eq!(stale["results"].as_array().unwrap().len(), 0);
+    assert!(stale["next_cursor"].is_null());
+    assert!(stale["revision"].as_i64().unwrap() > stable_revision);
+    Ok(())
 }
 impl Embedder for MockEngine {
     fn model_id(&self) -> Option<String> {

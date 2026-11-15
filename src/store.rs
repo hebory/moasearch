@@ -7,8 +7,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value, json};
 
-use crate::config::{canonical, excluded, within};
 use crate::extract::Passage;
+use crate::{
+    commands::ListCursor,
+    config::{canonical, excluded, within},
+};
 
 /// A complete file replacement. A record is published only after extraction and
 /// embedding have completed, so readers never observe a half-written document.
@@ -288,6 +291,8 @@ impl Store {
              CREATE INDEX IF NOT EXISTS chunks_file_text ON chunks(file_id,text,location);
              CREATE INDEX IF NOT EXISTS files_modified ON files(modified DESC);
              CREATE INDEX IF NOT EXISTS files_extension ON files(extension,modified DESC);
+             CREATE INDEX IF NOT EXISTS files_list_order
+                 ON files(name COLLATE NOCASE,path COLLATE NOCASE,id,root_id,extension,size,modified);
              CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                  path, content='files', content_rowid='id', tokenize='trigram');
              CREATE TABLE IF NOT EXISTS index_meta (
@@ -296,6 +301,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS lexical_meta (
                  id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
              INSERT OR IGNORE INTO lexical_meta(id,revision) VALUES(1,0);
+             CREATE TABLE IF NOT EXISTS files_list_meta (
+                 id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+             INSERT OR IGNORE INTO files_list_meta(id,revision) VALUES(1,0);
              INSERT INTO index_meta SELECT 1,0,
                  (SELECT count(*) FROM files), (SELECT count(*) FROM chunks),
                  (SELECT count(*) FROM chunks WHERE vector IS NOT NULL)
@@ -314,8 +322,21 @@ impl Store {
              CREATE TRIGGER IF NOT EXISTS files_lexical_ai AFTER INSERT ON files BEGIN
                  UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
              END;
+             CREATE TRIGGER IF NOT EXISTS files_list_ai AFTER INSERT ON files BEGIN
+                 UPDATE files_list_meta SET revision=revision+1 WHERE id=1;
+             END;
              CREATE TRIGGER IF NOT EXISTS files_lexical_ad AFTER DELETE ON files BEGIN
                  UPDATE lexical_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS files_list_ad AFTER DELETE ON files BEGIN
+                 UPDATE files_list_meta SET revision=revision+1 WHERE id=1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS files_list_au
+             AFTER UPDATE OF root_id,path,name,extension,size,modified ON files
+             WHEN old.root_id IS NOT new.root_id OR old.path IS NOT new.path
+               OR old.name IS NOT new.name OR old.extension IS NOT new.extension
+               OR old.size IS NOT new.size OR old.modified IS NOT new.modified BEGIN
+                 UPDATE files_list_meta SET revision=revision+1 WHERE id=1;
              END;
              CREATE TRIGGER IF NOT EXISTS files_lexical_au
              AFTER UPDATE OF root_id,path,name,extension,size,modified,status,error,reader_id ON files
@@ -577,6 +598,146 @@ impl Store {
                 row.get(0)
             })?,
         )
+    }
+
+    /// Revision for changes that can alter the visible file list.
+    pub fn list_revision(&self) -> Result<i64> {
+        let db = self.connect()?;
+        Ok(db.query_row(
+            "SELECT revision FROM files_list_meta WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn list_files_page(
+        &self,
+        limit: usize,
+        extension: Option<&str>,
+        folder: Option<&Path>,
+        cursor: Option<&ListCursor>,
+    ) -> Result<Value> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM files_list_meta WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let (folder_filter, folder_filter_value) = if cfg!(windows) {
+            (
+                "(?2 IS NULL OR f.path LIKE ?2 ESCAPE '\\' COLLATE NOCASE)",
+                folder.map(crate::search::scope_like),
+            )
+        } else {
+            (
+                "(?2 IS NULL OR f.path=?2 OR
+                 (substr(f.path,1,length(?2))=?2 AND
+                  (substr(?2,-1,1)='/' OR substr(f.path,length(?2)+1,1)='/'))) ",
+                folder.map(|path| path.to_string_lossy().into_owned()),
+            )
+        };
+        let total_sql = format!(
+            "SELECT count(*) FROM files f WHERE (?1 IS NULL OR f.extension=?1) AND {folder_filter}"
+        );
+        let total: i64 =
+            tx.query_row(&total_sql, params![extension, folder_filter_value], |row| {
+                row.get(0)
+            })?;
+        if cursor.is_some_and(|cursor| cursor.revision != revision) {
+            tx.commit()?;
+            return Ok(json!({
+                "results":[],
+                "total":total.max(0),
+                "next_cursor":null,
+                "revision":revision,
+                "reset_required":true
+            }));
+        }
+
+        let fetch_limit = limit.saturating_add(1) as i64;
+        let mut files = Vec::with_capacity(limit.saturating_add(1));
+        if let Some(cursor) = cursor {
+            let cursor_path = cursor.path.to_string_lossy();
+            let page_sql = format!(
+                "SELECT f.id,f.root_id,f.path,f.name,f.extension,f.size,f.modified
+                 FROM files f
+                 WHERE (?1 IS NULL OR f.extension=?1) AND {folder_filter}
+                   AND (f.name COLLATE NOCASE,f.path COLLATE NOCASE,f.id)
+                       > (?3 COLLATE NOCASE,?4 COLLATE NOCASE,?5)
+                 ORDER BY f.name COLLATE NOCASE,f.path COLLATE NOCASE,f.id LIMIT ?6"
+            );
+            let mut stmt = tx.prepare(&page_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    extension,
+                    folder_filter_value,
+                    cursor.name.as_str(),
+                    cursor_path.as_ref(),
+                    cursor.id,
+                    fetch_limit,
+                ],
+                |row| {
+                    Ok(json!({
+                        "id":row.get::<_,i64>(0)?,
+                        "root_id":row.get::<_,i64>(1)?,
+                        "path":row.get::<_,String>(2)?,
+                        "name":row.get::<_,String>(3)?,
+                        "extension":row.get::<_,String>(4)?,
+                        "size":row.get::<_,i64>(5)?,
+                        "modified":row.get::<_,i64>(6)?,
+                        "match_type":"filename"
+                    }))
+                },
+            )?;
+            files.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        } else {
+            let page_sql = format!(
+                "SELECT f.id,f.root_id,f.path,f.name,f.extension,f.size,f.modified
+                 FROM files f
+                 WHERE (?1 IS NULL OR f.extension=?1) AND {folder_filter}
+                 ORDER BY f.name COLLATE NOCASE,f.path COLLATE NOCASE,f.id LIMIT ?3"
+            );
+            let mut stmt = tx.prepare(&page_sql)?;
+            let rows = stmt.query_map(
+                params![extension, folder_filter_value, fetch_limit],
+                |row| {
+                    Ok(json!({
+                        "id":row.get::<_,i64>(0)?,
+                        "root_id":row.get::<_,i64>(1)?,
+                        "path":row.get::<_,String>(2)?,
+                        "name":row.get::<_,String>(3)?,
+                        "extension":row.get::<_,String>(4)?,
+                        "size":row.get::<_,i64>(5)?,
+                        "modified":row.get::<_,i64>(6)?,
+                        "match_type":"filename"
+                    }))
+                },
+            )?;
+            files.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        let has_more = files.len() > limit;
+        if has_more {
+            files.pop();
+        }
+        let next_cursor = if has_more {
+            files.last().map(|file| ListCursor {
+                name: file["name"].as_str().unwrap_or_default().to_string(),
+                path: PathBuf::from(file["path"].as_str().unwrap_or_default()),
+                id: file["id"].as_i64().unwrap_or_default(),
+                revision,
+            })
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(json!({
+            "results":files,
+            "total":total.max(0),
+            "next_cursor":next_cursor,
+            "revision":revision,
+            "reset_required":false
+        }))
     }
 
     pub fn counts(&self) -> Result<Value> {

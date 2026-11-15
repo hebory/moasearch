@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use moasearch::{
-    commands::{Command as AppCommand, SearchInput},
+    commands::{Command as AppCommand, ListCursor, ListFilesInput, SearchInput},
     config,
     engine::EmbeddedEngine,
     models, ocr,
@@ -56,6 +56,18 @@ enum Command {
         keyword: bool,
         #[arg(long)]
         folder: Option<PathBuf>,
+    },
+    /// 색인된 전체 파일 목록을 이름순으로 조회
+    Files {
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        #[arg(long)]
+        extension: Option<String>,
+        /// 이전 목록 응답의 next_cursor JSON
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// 검색된 문서를 근거로 Google Gemma 답변 생성
     Answer {
@@ -154,6 +166,21 @@ fn run() -> Result<()> {
                 extension: None,
                 mode: if keyword { "keyword" } else { "hybrid" }.into(),
                 folder,
+            }))?,
+        ),
+        Command::Files {
+            limit,
+            folder,
+            extension,
+            cursor,
+        } => emit(
+            AppServices::new(store, engine).execute(AppCommand::ListFiles(ListFilesInput {
+                limit,
+                folder,
+                extension,
+                cursor: cursor
+                    .map(|value| serde_json::from_str::<ListCursor>(&value))
+                    .transpose()?,
             }))?,
         ),
         Command::Answer { query, folder } => emit(AppServices::new(store, engine).execute(

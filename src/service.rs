@@ -102,6 +102,22 @@ impl AppServices {
                     input.folder.as_deref(),
                 )
             }
+            Command::ListFiles(input) => {
+                input.validate()?;
+                let extension = input
+                    .extension
+                    .as_deref()
+                    .map(|value| value.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!(".{value}"));
+                let folder = input.folder.as_deref().map(canonical_folder).transpose()?;
+                self.store.list_files_page(
+                    input.limit,
+                    extension.as_deref(),
+                    folder.as_deref(),
+                    input.cursor.as_ref(),
+                )
+            }
             Command::Answer(input) => {
                 input.validate()?;
                 anyhow::ensure!(
@@ -155,6 +171,7 @@ impl AppServices {
     fn status(&self) -> Result<Value> {
         Ok(json!({
             "counts":self.store.counts()?, "roots":self.store.roots()?,
+            "list_revision":self.store.list_revision()?,
             "settings":self.store.settings()?, "index":self.indexer.status(),
             "engine":self.engine.status(), "ocr":ocr::status(&self.store.data_dir.join("models")),
             "suggestions":suggestions(), "model_download":self.download.lock().unwrap().clone()
