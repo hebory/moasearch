@@ -18,6 +18,10 @@ class Element {
     this.hidden = false;
     this.disabled = false;
     this.open = false;
+    this.style = {};
+    this.scrollTop = 0;
+    this.clientHeight = 290;
+    this.scrollHeight = 290;
     this.classList = {
       add: (...names) => names.forEach(name => this.classList._set.add(name)),
       remove: (...names) => names.forEach(name => this.classList._set.delete(name)),
@@ -49,6 +53,7 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = [...children]; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
   removeAttribute(name) { this.attributes.delete(name); }
   querySelector(selector) {
     if (selector === '[type="submit"]') return this.submitButton || null;
@@ -101,6 +106,7 @@ function createApp() {
   elements.get('settings-form').namedItems.get('chat_enabled').type = 'checkbox';
   elements.get('settings-form').namedItems.get('chat_enabled').value = 'true';
   const documentListeners = new Map();
+  const windowListeners = new Map();
   const modeButtons = ['hybrid', 'keyword'].map(mode => {
     const button = new Element('button');
     button.dataset.mode = mode;
@@ -124,7 +130,7 @@ function createApp() {
   const calls = [];
   const window = {
     location: { hash: '', pathname: '/', search: '' },
-    addEventListener() {},
+    addEventListener(name, handler) { windowListeners.set(name, handler); },
     moa: {
       invoke(command, args) {
         const request = deferred();
@@ -137,7 +143,7 @@ function createApp() {
     window,
     document,
     location: window.location,
-    history: { replaceState() {} },
+    history: { replaceState(_state, _title, url) { window.location.hash = String(url).includes('#') ? `#${String(url).split('#')[1]}` : ''; } },
     URLSearchParams,
     FormData: FormDataMock,
     Intl,
@@ -162,11 +168,15 @@ function createApp() {
       ...overrides,
     });
   }
-  return { elements, calls, call, runTimer, resolveStatus, document, modeButtons, documentListeners };
+  return { elements, calls, call, runTimer, resolveStatus, document, modeButtons, documentListeners, window, windowListeners };
 }
 
 function searchResult(id, name) {
   return { id, name, path: `C:\\docs\\${name}`, extension: 'txt', size: 12, modified: '', snippet: '내용' };
+}
+
+function listResult(id) {
+  return { id, name: `file-${String(id).padStart(4, '0')}.txt`, path: `C:\\docs\\file-${String(id).padStart(4, '0')}.txt`, extension: 'txt', size: 12, modified: '' };
 }
 
 function textTree(node) {
@@ -230,6 +240,255 @@ test('uses desktop search shortcuts without taking focus from a settings dialog'
   assert.doesNotMatch(html, /id="(?:quit-dialog|confirm-quit|quit-app)"/, 'the native close button needs no web confirmation');
 });
 
+test('loads the blank-query file list in cursor pages while virtual rows preserve selection and DOM', async () => {
+  const app = createApp();
+  app.resolveStatus({
+    roots: [{ id: 1, path: 'C:\\docs' }],
+    list_revision: 7,
+    settings: { chat_enabled: true, gpu_mode: 'auto' },
+    engine: { embedding_ready: true, chat_ready: true },
+  });
+  await flushAsyncWork();
+  const list = app.elements.get('results-list');
+  const firstPage = app.call('list_files')[0];
+  const cursor = { name: 'file-0200.txt', path: 'C:\\docs\\file-0200.txt', id: 200, revision: 7 };
+  firstPage.resolve({ results: Array.from({ length: 200 }, (_, index) => listResult(index + 1)), total: 500, next_cursor: cursor, revision: 7 });
+  await flushAsyncWork();
+
+  assert.equal(firstPage.args.limit, 200);
+  assert.equal(firstPage.args.query, undefined, 'browse uses the dedicated list command, not an empty search');
+  assert.match(app.elements.get('results-title').textContent, /파일 500개 · 200개 불러옴/);
+  app.runTimer(12000);
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], list_revision: 7 });
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent, /파일 500개 · 200개 불러옴/, 'same-revision status polls preserve browse counts');
+  assert.equal(app.call('list_files').length, 1, 'same-revision status polls do not reload browse pages');
+  let rows = list.querySelectorAll('.result-card');
+  assert.ok(rows.length <= 100, `virtual rendering caps rows, got ${rows.length}`);
+  assert.match(textTree(rows[0]), /—/, 'browse does not claim a filename match');
+  assert.equal(app.elements.get('answer-request').disabled, true, 'browse results never enable AI answers');
+  app.elements.get('answer-request').dispatch('click');
+  assert.equal(app.call('answer').length, 0);
+
+  list.scrollHeight = 100000;
+  list.scrollTop = 5500;
+  list.dispatch('scroll');
+  rows = list.querySelectorAll('.result-card');
+  const selected = rows.find(row => row.getAttribute('data-result-id') === '191');
+  assert.ok(selected);
+  selected.dispatch('click');
+  assert.equal(selected.getAttribute('aria-selected'), 'true');
+  list.scrollHeight = 200 * 29;
+  list.scrollTop = list.scrollHeight - list.clientHeight - 10;
+  list.dispatch('scroll');
+  const secondPage = app.call('list_files')[1];
+  assert.deepEqual(secondPage.args.cursor, cursor);
+  secondPage.resolve({ results: Array.from({ length: 200 }, (_, index) => listResult(index + 201)), total: 500, next_cursor: { name: 'file-0400.txt', path: 'C:\\docs\\file-0400.txt', id: 400, revision: 7 }, revision: 7 });
+  await flushAsyncWork();
+  rows = list.querySelectorAll('.result-card');
+  assert.ok(rows.length <= 100);
+  assert.ok(rows.includes(selected), 'page append keeps unchanged visible row nodes');
+  assert.equal(selected.getAttribute('aria-selected'), 'true', 'page append keeps selected file');
+  assert.match(app.elements.get('results-title').textContent, /400개 불러옴/);
+  assert.equal(list.scrollTop, list.scrollHeight - list.clientHeight - 10, 'append preserves the user scroll position');
+  const pagesBeforeResize = app.call('list_files').length;
+  list.clientHeight = 580;
+  app.windowListeners.get('resize')();
+  assert.equal(app.call('list_files').length, pagesBeforeResize, 'resizing only rerenders the virtual window');
+  assert.ok(list.querySelectorAll('.result-card').length <= 100);
+  app.elements.get('query').dispatch('keydown', { key: 'Enter' });
+  assert.equal(app.call('open_file').at(-1).args.id, 191, 'Enter opens the selected browse row');
+  app.elements.get('query').dispatch('keydown', { key: 'Enter', ctrlKey: true });
+  assert.equal(app.call('reveal_file').at(-1).args.id, 191);
+
+  list.clientHeight = 290;
+  list.scrollHeight = 400 * 29;
+  list.scrollTop = list.scrollHeight - list.clientHeight - 10;
+  list.dispatch('scroll');
+  const changedRevisionPage = app.call('list_files')[2];
+  changedRevisionPage.resolve({ results: [], total: 510, next_cursor: null, revision: 8, reset_required: true });
+  await flushAsyncWork();
+  const restarted = app.call('list_files')[3];
+  assert.equal(restarted.args.cursor, null, 'a changed database revision restarts from page one');
+  assert.doesNotMatch(textTree(list), /file-0191/, 'the old page set is cleared during revision restart');
+  restarted.resolve({ results: [listResult(501)], total: 510, next_cursor: null, revision: 8 });
+  await flushAsyncWork();
+  assert.match(textTree(list), /file-0501/);
+});
+
+test('index completion refreshes folder scope without resetting a stable browse list', async () => {
+  const app = createApp();
+  app.resolveStatus({
+    roots: [{ id: 1, path: 'C:\\docs' }], list_revision: 11,
+    index: { running: true },
+  });
+  await flushAsyncWork();
+
+  app.window.location.hash = '#folder=C%3A%5Cdocs%5Cchild';
+  app.windowListeners.get('hashchange')();
+  app.call('scope')[0].resolve({ path: 'C:\\docs\\child', indexed: true, covered: true });
+  await flushAsyncWork();
+  app.call('list_files')[1].resolve({ results: [listResult(5)], total: 1, next_cursor: null, revision: 11 });
+  await flushAsyncWork();
+
+  app.runTimer(2800);
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], list_revision: 11, index: { running: false } });
+  await flushAsyncWork();
+  assert.equal(app.call('list_files').length, 2, 'index completion with unchanged revision does not restart the list');
+  const scopeRefresh = app.call('scope').at(-1);
+  assert.equal(scopeRefresh.args.path, 'C:\\docs\\child');
+  scopeRefresh.resolve({ path: 'C:\\docs\\child', indexed: true, covered: true, root_path: 'C:\\docs' });
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent, /파일 1개 · 1개 불러옴/);
+  assert.match(textTree(app.elements.get('results-list')), /file-0005/);
+});
+
+test('coalesces immediate lexical input, delays hybrid, and ignores stale responses', async () => {
+  const app = createApp();
+  app.resolveStatus({ engine: { embedding_ready: true, chat_ready: true }, settings: { chat_enabled: true, gpu_mode: 'auto' } });
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  query.value = '계';
+  query.dispatch('input');
+  assert.equal(app.call('search').length, 1, 'the first character is searched immediately');
+  const first = app.call('search')[0];
+  assert.equal(first.args.mode, 'instant');
+  query.value = '계약';
+  query.dispatch('input');
+  query.value = '계약서';
+  query.dispatch('input');
+  assert.equal(app.call('search').length, 1, 'rapid keystrokes are coalesced behind the active request');
+  first.resolve({ results: [searchResult(99, 'stale.txt')] });
+  await flushAsyncWork();
+  const latest = app.call('search')[1];
+  assert.equal(latest.args.query, '계약서');
+  assert.doesNotMatch(textTree(app.elements.get('results-list')), /stale\.txt/);
+  latest.resolve({ results: [searchResult(1, 'contract.txt')] });
+  await flushAsyncWork();
+  assert.equal(app.call('search').length, 2);
+  app.runTimer(200);
+  await flushAsyncWork();
+  assert.equal(app.call('search').length, 3, 'the hybrid timer reuses a completed instant request instead of sending it again');
+  app.elements.get('search-form').dispatch('submit');
+  await flushAsyncWork();
+  assert.equal(app.call('search').length, 3, 'repeated Enter while hybrid search is pending reuses its in-flight request');
+  const hybrid = app.call('search')[2];
+  assert.equal(hybrid.args.mode, 'hybrid');
+  assert.equal(hybrid.args.query, '계약서');
+  hybrid.resolve({ results: [searchResult(2, 'semantic-contract.txt')] });
+  await flushAsyncWork();
+  assert.match(textTree(app.elements.get('results-list')), /semantic-contract\.txt/);
+  assert.doesNotMatch(textTree(app.elements.get('results-list')), /stale\.txt/);
+});
+
+test('an old browse ArrowDown continuation cannot change selection after a new search', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }] });
+  await flushAsyncWork();
+  app.call('list_files')[0].resolve({ results: [listResult(1)], total: 2, next_cursor: { name: 'file-0002.txt', path: 'C:\\docs\\file-0002.txt', id: 2 }, revision: 1 });
+  await flushAsyncWork();
+
+  app.elements.get('query').dispatch('keydown', { key: 'ArrowDown', preventDefault() {} });
+  const olderPage = app.call('list_files')[1];
+  app.elements.get('query').value = '새 검색';
+  app.elements.get('query').dispatch('input');
+  app.call('search')[0].resolve({ results: [searchResult(70, '새결과.txt'), searchResult(71, '다른결과.txt')] });
+  await flushAsyncWork();
+  assert.equal(app.call('file').at(-1).args.id, 70);
+
+  olderPage.resolve({ results: [listResult(2)], total: 2, next_cursor: null, revision: 1 });
+  await flushAsyncWork();
+  const selected = app.elements.get('results-list').querySelectorAll('.result-card').filter(row => row.getAttribute('aria-selected') === 'true');
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].getAttribute('data-result-id'), '70', 'the current search selection stays active after the obsolete page completes');
+  assert.equal(app.call('file').at(-1).args.id, 70, 'the stale key handler does not request a preview for another file');
+});
+
+test('retries a failed browse page with the same cursor and preserves already loaded selection', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }] });
+  await flushAsyncWork();
+  const list = app.elements.get('results-list');
+  const cursor = { name: 'file-0001.txt', path: 'C:\\docs\\file-0001.txt', id: 1, revision: 3 };
+  app.call('list_files')[0].resolve({ results: [listResult(1)], total: 2, next_cursor: cursor, revision: 3 });
+  await flushAsyncWork();
+  const previewCalls = app.call('file').length;
+
+  list.scrollHeight = 350;
+  list.scrollTop = 0;
+  list.dispatch('scroll');
+  const failedPage = app.call('list_files')[1];
+  failedPage.reject(new Error('temporary list failure'));
+  await flushAsyncWork();
+  assert.match(textTree(list), /file-0001/);
+  assert.match(textTree(list), /다시 불러오기/);
+
+  function findRetry(node) {
+    if (node.tagName === 'BUTTON' && node.textContent === '다시 불러오기') return node;
+    for (const child of node.children || []) { const found = findRetry(child); if (found) return found; }
+    return null;
+  }
+  findRetry(list).dispatch('click');
+  const retry = app.call('list_files')[2];
+  assert.deepEqual(retry.args.cursor, cursor, 'retry continues at the failed page cursor');
+  retry.resolve({ results: [listResult(2)], total: 2, next_cursor: null, revision: 3 });
+  await flushAsyncWork();
+  assert.match(textTree(list), /file-0001/);
+  assert.match(textTree(list), /file-0002/);
+  const selected = list.querySelectorAll('.result-card').filter(row => row.getAttribute('aria-selected') === 'true');
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].getAttribute('data-result-id'), '1');
+  assert.equal(app.call('file').length, previewCalls, 'retry keeps the selected preview instead of reloading it');
+});
+
+test('IME composition sends one completed query and composition Enter never opens a file', async () => {
+  const app = createApp();
+  app.resolveStatus({ engine: { embedding_ready: true } });
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  query.dispatch('compositionstart');
+  query.value = '회의';
+  query.dispatch('input', { isComposing: true });
+  query.dispatch('keydown', { key: 'Enter', isComposing: true, keyCode: 229 });
+  assert.equal(app.call('search').length, 0, 'IME intermediate text is not sent');
+  assert.equal(app.call('open_file').length, 0, 'IME confirm Enter does not open a file');
+  query.dispatch('compositionend');
+  query.dispatch('input', { isComposing: false });
+  assert.equal(app.call('search').length, 1, 'compositionend dispatches one immediate lexical search');
+  assert.equal(app.call('search')[0].args.query, '회의');
+});
+
+test('filter and scope changes invalidate prior browse pages and reload the right folder', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }] });
+  await flushAsyncWork();
+  const stale = app.call('list_files')[0];
+  app.elements.get('extension-filter').value = 'pdf';
+  app.elements.get('extension-filter').dispatch('change');
+  const filtered = app.call('list_files')[1];
+  assert.equal(filtered.args.extension, 'pdf');
+  stale.resolve({ results: [listResult(1)], total: 1, next_cursor: null, revision: 1 });
+  await flushAsyncWork();
+  assert.doesNotMatch(textTree(app.elements.get('results-list')), /file-0001/);
+  filtered.resolve({ results: [{ ...listResult(2), name: 'scan.pdf', extension: 'pdf' }], total: 1, next_cursor: null, revision: 2 });
+  await flushAsyncWork();
+  assert.match(textTree(app.elements.get('results-list')), /scan\.pdf/);
+
+  app.window.location.hash = '#folder=C%3A%5Cdocs%5Cchild';
+  app.windowListeners.get('hashchange')();
+  const scopeRequest = app.call('scope')[0];
+  scopeRequest.resolve({ path: 'C:\\docs\\child', indexed: true, covered: true });
+  await flushAsyncWork();
+  const scoped = app.call('list_files').at(-1);
+  assert.equal(scoped.args.folder, 'C:\\docs\\child');
+  scoped.resolve({ results: [{ ...listResult(3), name: 'scoped.pdf', extension: 'pdf' }], total: 1, next_cursor: null, revision: 3 });
+  await flushAsyncWork();
+  assert.match(textTree(app.elements.get('results-list')), /scoped\.pdf/);
+  app.elements.get('folder-scope-clear').dispatch('click');
+  const cleared = app.call('list_files').at(-1);
+  assert.equal(cleared.args.folder, null, 'clearing scope restores the library listing');
+});
+
 test('follows the top semantic result until the user explicitly chooses a file', async () => {
   const app = createApp();
   app.resolveStatus({ engine: { embedding_ready: true } });
@@ -244,10 +503,13 @@ test('follows the top semantic result until the user explicitly chooses a file',
   app.elements.get('query').dispatch('keydown', { key: 'Enter' });
   assert.equal(app.call('open_file').at(-1).args.id, 2);
 
-  app.elements.get('search-form').dispatch('submit');
+  app.elements.get('query').value = '영수증 합치기 추가';
+  app.elements.get('query').dispatch('input');
   app.call('search')[2].resolve({ results: [searchResult(1, 'instant.txt'), searchResult(3, 'chosen.txt')] });
   await flushAsyncWork();
   app.elements.get('query').dispatch('keydown', { key: 'ArrowDown' });
+  app.runTimer(200);
+  await flushAsyncWork();
   app.call('search')[3].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(3, 'chosen.txt')] });
   await flushAsyncWork();
   assert.equal(app.elements.get('results-list').querySelectorAll('.result-card')[1].attributes.get('aria-selected'), 'true');
@@ -383,9 +645,9 @@ test('disables stale questions immediately and only enables them after the lates
   query.dispatch('input');
   assert.equal(question.disabled, true, 'editing the query disables questions before debounce');
   assert.equal(answer.hidden, true, 'editing the query hides an answer for the previous query');
-  assert.equal(app.elements.get('results-title').textContent, '검색 대기 중…');
+  assert.equal(app.elements.get('results-title').textContent, '파일 찾는 중…');
   assert.equal(app.elements.get('results-list').children.length, 1, 'the previous result cards are cleared immediately');
-  assert.match(textTree(app.elements.get('results-list')), /검색어 입력이 끝나면 검색합니다/);
+  assert.match(textTree(app.elements.get('results-list')), /파일명과 본문을 찾고 있어요/);
   assert.match(textTree(app.elements.get('preview')), /파일을 선택해 주세요/, 'the previous file preview is cleared immediately');
   question.dispatch('click');
   assert.equal(app.call('answer').length, 1, 'a stale question cannot be submitted during debounce');
@@ -398,7 +660,6 @@ test('disables stale questions immediately and only enables them after the lates
   await flushAsyncWork();
   assert.equal(question.disabled, true, 'a stale response cannot re-enable the question button');
 
-  app.runTimer(160);
   const thirdSearch = app.call('search')[2];
   assert.equal(question.disabled, true, 'question remains disabled during the replacement search');
   thirdSearch.resolve({ results: [searchResult(3, 'third.txt')] });
@@ -412,12 +673,14 @@ test('disables stale questions immediately and only enables them after the lates
   query.value = '다섯 번째 검색';
   query.dispatch('input');
   form.dispatch('submit');
+  assert.equal(app.call('search').length, 4, 'only one fast search is in flight while the latest input is coalesced');
+  fourthSearch.resolve({ results: [] });
+  await flushAsyncWork();
   const fifthSearch = app.call('search')[4];
+  assert.equal(fifthSearch.args.query, '다섯 번째 검색');
   fifthSearch.resolve({ results: [searchResult(5, 'fifth.txt')] });
   await flushAsyncWork();
   assert.equal(question.disabled, false);
-  fourthSearch.resolve({ results: [] });
-  await flushAsyncWork();
   assert.equal(question.disabled, false, 'a late stale response cannot disable the latest completed search');
   question.dispatch('click');
   assert.equal(app.call('answer').at(-1).args.query, '다섯 번째 검색');
@@ -449,7 +712,7 @@ test('shows instant lexical matches before hybrid results and ignores a stale se
   const nextInstant = app.call('search')[2];
   semantic.resolve({ results: [searchResult(99, 'stale.txt')] });
   await flushAsyncWork();
-  assert.match(app.elements.get('results-title').textContent, /검색 중/);
+  assert.match(app.elements.get('results-title').textContent, /찾는 중/);
   nextInstant.resolve({ results: [searchResult(2, 'budget.txt')] });
   await flushAsyncWork();
   const nextSemantic = app.call('search')[3];

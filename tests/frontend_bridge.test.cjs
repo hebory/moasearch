@@ -69,6 +69,16 @@ test('rejects native errors as readable Error objects', async () => {
   await assert.rejects(pending, { message: '폴더를 찾을 수 없습니다.' });
 });
 
+test('passes only file-list pagination fields through the native bridge', async () => {
+  const bridge = createBridge();
+  const cursor = { name: '가.txt', path: 'D:\\자료\\가.txt', id: 12, revision: 3 };
+  const pending = bridge.window.moa.invoke('list_files', { limit: 200, extension: 'txt', folder: 'D:\\자료', cursor });
+  assert.deepEqual(bridge.messages[0].args.cursor, cursor);
+  respond(bridge, bridge.messages[0], { ok: true, value: { results: [], total: 200, next_cursor: null, revision: 3 } });
+  assert.equal((await pending).total, 200);
+  await assert.rejects(bridge.window.moa.invoke('list_files', { query: 'x' }), /형식이 올바르지/);
+});
+
 test('ignores responses from another window session', async () => {
   const bridge = createBridge();
   const pending = bridge.window.moa.invoke('status');

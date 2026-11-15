@@ -4,7 +4,7 @@
     {
       "id": "moasearch",
       "name": "모아검색",
-      "description": "파일명을 먼저 검색하고 EmbeddingGemma 2 Q8_0로 본문 의미를 검색합니다. CUDA 가속, PP-OCRv5 이미지·스캔 PDF OCR, HWP/HWPX를 지원하며 AI 답변은 설정에서 선택합니다.",
+      "description": "색인된 전체 파일 목록을 보고 입력 즉시 파일명·본문을 검색합니다. EmbeddingGemma 2 Q8_0 의미 검색을 지원합니다. CUDA 가속, PP-OCRv5 이미지·스캔 PDF OCR, HWP/HWPX를 지원하며 AI 답변은 설정에서 선택합니다.",
       "category": "파일 · AI 검색",
       "accentColor": "#436F5D",
       "monogram": "Ms",

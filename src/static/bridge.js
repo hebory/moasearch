@@ -10,6 +10,7 @@
     cancel_index: new Set(),
     update_settings: new Set(['settings']),
     search: new Set(['query', 'limit', 'mode', 'extension', 'folder']),
+    list_files: new Set(['limit', 'extension', 'folder', 'cursor']),
     answer: new Set(['query', 'limit', 'folder']),
     file: new Set(['id']),
     open_file: new Set(['id']),
