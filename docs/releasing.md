@@ -2,7 +2,9 @@
 
 ## 패키지 만들기
 
-배포에는 x64 Windows 실행 파일, ONNX Runtime 1.28.0 DLL 두 개, 해당 라이선스 고지, Microsoft Authenticode로 확인한 MSVC CRT 세 파일이 필요합니다. 이번 배포는 Windows `System32`의 `14.50.35719.0` 파일을 출처로 고정하고, 파일 서명·세 CRT의 공통 버전·llama.cpp 최소 버전 `14.39.0.0`을 확인합니다. 공식 CRT 재배포본을 따로 제공할 때에는 `-CrtDirectory`로 Microsoft 서명된 파일의 디렉터리를 지정하세요. 임의 파일이나 Microsoft 서명이 검증되지 않은 CRT는 패키지에 넣지 않습니다.
+배포에는 x64 Windows 실행 파일, ONNX Runtime 1.28.0 DLL 두 개, CUDA runtime DLL 세 개(`cudart64_13.dll`, `cublas64_13.dll`, `cublasLt64_13.dll`), 각 라이선스 고지, Microsoft Authenticode로 확인한 MSVC CRT 세 파일이 필요합니다. CUDA Toolkit의 `LICENSE`는 `CUDA-Runtime-LICENSE`로 함께 배포합니다. 이번 배포는 Windows `System32`의 `14.50.35719.0` CRT 파일을 출처로 고정하고, 파일 서명·세 CRT의 공통 버전·llama.cpp 최소 버전 `14.39.0.0`을 확인합니다. 공식 CRT 재배포본을 따로 제공할 때에는 `-CrtDirectory`로 Microsoft 서명된 파일의 디렉터리를 지정하세요.
+
+기본 `build.ps1`은 CUDA Toolkit을 사용해 `gpu` feature를 빌드합니다. 설치 사용자는 Toolkit을 설치할 필요가 없으며, 호환되는 NVIDIA 드라이버와 GPU를 사용할 수 없으면 CPU backend로 실행합니다. `cuda-no-vmm` 설정은 앱 시작 시 NVIDIA 드라이버 DLL을 필수 로더 의존성으로 만들지 않습니다. 출하 전 Toolkit 경로를 PATH에서 제외한 실행과 `CUDA_VISIBLE_DEVICES=-1` 상태의 CPU 전환을 별도로 확인합니다. CPU 전용 개발 빌드는 `build.ps1 -CpuOnly`를 사용합니다.
 
 검증 당시 파일 출처는 `C:\Windows\System32`이며 CRT 제품 버전은 `14.50.35719.0`입니다. SHA-256은 `MSVCP140.dll` `def46aa6a8f72f27bafac0c43334419486a4d1dcdb6c479a8ef7034b3e1fa4cb`, `VCRUNTIME140.dll` `184146852727a9db4eea06178716bec3cdbb1015c911f6b0f915b184ad7775b2`, `VCRUNTIME140_1.dll` `e6bfb3662ab4b1969a73441dbe35c96d51441b6bff8cf1fe7430bd5b246ca605`입니다. 실제 패키지에서 선택된 출처·버전·서명·체크섬은 생성된 릴리스 명세에도 기록합니다.
 
@@ -11,7 +13,7 @@
 ```powershell
 $licenses = .\packaging\collect-licenses.ps1 | ConvertFrom-Json
 .\packaging\release.ps1 `
-  -Version 0.4.3 `
+  -Version 0.5.0 `
   -SkipBuild `
   -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
   -CrtDirectory "$env:SystemRoot\System32" `
@@ -22,9 +24,9 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 `dist\artifacts\`에 다음 공개 파일이 생성됩니다.
 
-- `moasearch-0.4.3-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
-- `moasearch-0.4.3-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
-- `moasearch-0.4.3-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
+- `moasearch-0.5.0-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
+- `moasearch-0.5.0-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
+- `moasearch-0.5.0-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
 - `SHA256SUMS.txt`: 설치기·ZIP·배포 명세·아이콘·커버·카탈로그 총 6개 파일의 SHA-256 (체크섬 파일 자신은 제외)
 - `icon.png`, `cover.png`: Moa Launcher 앱 아이콘과 커버
 - `moalauncher.json`: Moa Launcher 카탈로그 등록 메타데이터
@@ -39,13 +41,13 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 설치기는 Windows 10/11 x64에서 `{localappdata}\Programs\moasearch` 아래에 현재 사용자 권한으로 설치합니다. 로컬 AI 기능은 AVX2를 지원하는 x64 CPU가 필요합니다. 관리자 권한을 요구하지 않습니다. `/SILENT /DIR="<경로>" /NORESTART` 옵션을 지원하며, 자동 설치에서는 앱을 시작하지 않습니다. 대화형 설치에서는 완료 화면의 실행 선택 항목을 제공합니다.
 
-직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.4.3에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.4.3은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
+직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.5.0에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.5.0은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
 
 **탐색기에서 현재 폴더 검색** 옵션은 현재 사용자 `HKCU\Software\Classes` 아래의 `Directory\shell\MoaSearch.SearchFolder`와 `Directory\Background\shell\MoaSearch.SearchBackground`를 등록합니다. 옵션 해제 업데이트와 설치 제거 시 이 두 앱 전용 키를 정리합니다. 폴더와 빈 공간의 명령은 각각 `%1`, `%V` 경로를 `open-folder --path`에 전달하며, 드라이브 루트의 끝 역슬래시가 인용부호와 충돌하지 않도록 `\.`을 붙입니다. Windows 11에서는 **추가 옵션 표시**에 나타날 수 있습니다. 등록 형식은 [Microsoft Shell 문서](https://learn.microsoft.com/windows/win32/shell/reg-shell-exts), 설치·제거 조건은 [Inno Setup Registry 문서](https://jrsoftware.org/ishelp/topic_registrysection.htm)를 따릅니다.
 
 ## Moa Launcher 카탈로그
 
-Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.4.3`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.4.3-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.4.3-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
+Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.5.0`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.5.0-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.5.0-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
 
 Moa Launcher는 앱의 루트에서 공개 `icon.png`와 `cover.png`를 표시합니다. 이 이미지를 저장소 기본 브랜치에 게시하고 카탈로그의 앱 항목에서 해당 GitHub 이미지 주소를 참조하세요. `assets\branding\moasearch.ico`는 Windows 설치기의 아이콘이고, 모아 런처 상세 화면의 PNG 아이콘과 커버를 대체하지 않습니다.
 
