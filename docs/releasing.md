@@ -13,7 +13,7 @@
 ```powershell
 $licenses = .\packaging\collect-licenses.ps1 | ConvertFrom-Json
 .\packaging\release.ps1 `
-  -Version 0.5.0 `
+  -Version 0.5.1 `
   -SkipBuild `
   -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
   -CrtDirectory "$env:SystemRoot\System32" `
