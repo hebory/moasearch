@@ -67,14 +67,22 @@ class Element {
 
 class FormDataMock {
   constructor(form) { this.form = form; }
-  get(name) { return this.form.elements.namedItem(name).value; }
+  get(name) {
+    const control = this.form.elements.namedItem(name);
+    if (control.type === 'checkbox' && !control.checked) return null;
+    return control.value;
+  }
 }
 
 function deferred() {
   let resolve;
   let reject;
-  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
+  let settled = false;
+  const promise = new Promise((res, rej) => {
+    resolve = value => { settled = true; res(value); };
+    reject = error => { settled = true; rej(error); };
+  });
+  return { promise, resolve, reject, get settled() { return settled; } };
 }
 
 async function flushAsyncWork() {
@@ -87,8 +95,10 @@ function createApp() {
   const submitButton = new Element('button');
   elements.get('settings-form').submitButton = submitButton;
   elements.get('settings-form').namedItems = new Map([
-    'embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb','filename_only_dirs',
+    'embedding_model','chat_model','n_gpu_layers','context_size','scan_interval','max_file_mb','filename_only_dirs','gpu_mode','chat_enabled',
   ].map(key => [key, new Element('input')]));
+  elements.get('settings-form').namedItems.get('chat_enabled').type = 'checkbox';
+  elements.get('settings-form').namedItems.get('chat_enabled').value = 'true';
   const documentListeners = new Map();
   const modeButtons = ['hybrid', 'keyword'].map(mode => {
     const button = new Element('button');
@@ -117,7 +127,7 @@ function createApp() {
     moa: {
       invoke(command, args) {
         const request = deferred();
-        calls.push({ command, args, ...request });
+        calls.push({ command, args, ...request, isSettled: () => request.settled });
         return request.promise;
       },
     },
@@ -143,9 +153,11 @@ function createApp() {
     entry[1].handler();
   }
   function resolveStatus(overrides = {}) {
-    call('status')[0].resolve({
+    const request = call('status').find(entry => !entry.isSettled());
+    assert.ok(request, 'expected a pending status request');
+    request.resolve({
       roots: [], counts: { files: 0, chunks: 0, vectors: 0 },
-      index: { running: false }, engine: {}, settings: {}, ocr: {}, model_download: {},
+      index: { running: false }, engine: { embedding_ready: false, chat_ready: true }, settings: { chat_enabled: true, gpu_mode: 'auto' }, ocr: {}, model_download: {},
       ...overrides,
     });
   }
@@ -177,6 +189,40 @@ test('shows embedding chunk progress together with files scanned', async () => {
   assert.match(app.elements.get('progress-detail').textContent, /긴 본문\.txt/);
 });
 
+test('reports background filename, body/OCR, and embedding preparation', async () => {
+  const phases = [
+    { phase: 'metadata', metadata_done: 5, metadata_total: 12, expected: /파일명·경로 색인 중 · 5\/12개 파일/ },
+    { phase: 'content', content_done: 2, content_total: 7, expected: /본문·OCR 분석 중 · 2\/7개 파일/ },
+    { phase: 'embedding', embedding_done_chunks: 4, embedding_total_chunks: 13, expected: /EmbeddingGemma 2 Q8_0 · 4\/13개 본문 조각 분석 중/ },
+  ];
+  for (const phase of phases) {
+    const app = createApp();
+    app.resolveStatus({
+      index: { running: true, scanned: 5, indexed: 1, skipped: 0, errors: 0, ...phase },
+      engine: { embedding_ready: true, chat_ready: false, gpu_backend: 'CUDA', gpu_active: false, gpu_layers_offloaded: 0 },
+      ocr: { ready: true },
+    });
+    await flushAsyncWork();
+    assert.match(app.elements.get('progress-label').textContent, phase.expected);
+    assert.match(app.elements.get('engine-message').textContent, phase.phase === 'metadata' ? /파일명 색인 중/ : /파일명 검색 · 위치 등록 대기/);
+    assert.match(app.elements.get('engine-message').textContent, /PP-OCRv5 준비됨/);
+    assert.match(app.elements.get('engine-message').textContent, /EmbeddingGemma 2 Q8_0 · 준비됨/);
+    assert.match(app.elements.get('engine-message').textContent, /CUDA 모델 로드됨 · GPU 층 0개/);
+  }
+});
+
+test('shows PDF extraction stage and page progress inside the content phase', async () => {
+  const app = createApp();
+  app.resolveStatus({ index: {
+    running: true, phase: 'content', content_phase: 'pdf_ocr', content_done: 3, content_total: 9,
+    current_page: 7, total_pages: 18, current_path: 'D:\\docs\\scan.pdf', scanned: 11, errors: 0,
+  } });
+  await flushAsyncWork();
+  assert.match(app.elements.get('progress-label').textContent, /본문·OCR 분석 중 · 3\/9개 파일 · PDF에서 글자를 찾는 중/);
+  assert.match(app.elements.get('progress-detail').textContent, /7\/18페이지/);
+  assert.match(app.elements.get('progress-detail').textContent, /11개 파일 확인/);
+});
+
 test('keeps terminal index summaries visible without implying completion on errors or cancellation', async () => {
   const idle = createApp();
   idle.resolveStatus();
@@ -201,11 +247,32 @@ test('keeps terminal index summaries visible without implying completion on erro
     assert.equal(app.elements.get('cancel-index').hidden, true);
     assert.equal(app.elements.get('cancel-index').disabled, true);
     assert.match(app.elements.get('progress-label').textContent, label);
-    assert.match(app.elements.get('progress-detail').textContent, /확인 \d+개 · 저장 \d+개 · 건너뜀 \d+개 · 오류 \d+개/);
+    assert.match(app.elements.get('progress-detail').textContent, /확인 \d+개 · 목록 갱신 \d+개 · 건너뜀 \d+개 · 오류 \d+개/);
     if (extra) assert.match(app.elements.get('progress-detail').textContent, extra);
     if (index.reused !== undefined) assert.match(app.elements.get('progress-detail').textContent, /재사용 3개 파일·22개 조각/);
     else assert.doesNotMatch(app.elements.get('progress-detail').textContent, /재사용 \d+개 파일/);
   }
+});
+
+test('distinguishes disabled or pending semantic indexing and unknown CUDA layer count', async () => {
+  const disabled = createApp();
+  disabled.resolveStatus({
+    index: { running: false, phase: 'complete', scanned: 12, indexed: 8, skipped: 4, errors: 0, embedding_state: 'disabled', content_done: 5, content_total: 9, embedding_done_chunks: 0, embedding_total_chunks: 0 },
+    engine: { embedding_ready: false, chat_ready: false, gpu_backend: 'CUDA', gpu_active: false, gpu_layers_offloaded: null },
+  });
+  await flushAsyncWork();
+  assert.match(disabled.elements.get('progress-label').textContent, /파일명·본문 색인 완료 · 의미 색인 꺼짐/);
+  assert.match(disabled.elements.get('progress-detail').textContent, /목록 갱신 8개 · 건너뜀 4개 · 오류 0개 · 본문 5\/9개 파일 · 의미 색인 꺼짐/);
+  assert.match(disabled.elements.get('engine-message').textContent, /CUDA 모델 로드됨 · GPU 층 수 확인 불가/);
+  assert.doesNotMatch(disabled.elements.get('engine-message').textContent, /모델 실행 전/);
+
+  const pending = createApp();
+  pending.resolveStatus({
+    index: { running: false, phase: 'complete', scanned: 12, indexed: 8, skipped: 4, errors: 0, embedding_state: 'pending', content_done: 9, content_total: 9, embedding_done_chunks: 6, embedding_total_chunks: 10 },
+  });
+  await flushAsyncWork();
+  assert.match(pending.elements.get('progress-label').textContent, /의미 색인이 남아 있어요/);
+  assert.match(pending.elements.get('progress-detail').textContent, /본문 9\/9개 파일 · 의미 대기 6\/10개 조각/);
 });
 
 test('disables stale questions immediately and only enables them after the latest search', async () => {
@@ -273,6 +340,43 @@ test('disables stale questions immediately and only enables them after the lates
   assert.equal(app.call('answer').at(-1).args.query, '다섯 번째 검색');
 });
 
+test('shows instant lexical matches before hybrid results and ignores a stale semantic response', async () => {
+  const app = createApp();
+  app.resolveStatus({
+    engine: { embedding_ready: true, chat_ready: true },
+    settings: { chat_enabled: true, gpu_mode: 'auto' },
+  });
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  const form = app.elements.get('search-form');
+  query.value = '계약 갱신 기간';
+  form.dispatch('submit');
+  const instant = app.call('search')[0];
+  assert.equal(instant.args.mode, 'instant');
+  instant.resolve({ results: [searchResult(1, 'contract.txt')] });
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent, /파일명·키워드 결과 1개 · 의미 검색 중/);
+  assert.match(textTree(app.elements.get('results-list')), /결과를 먼저 보여드리고/);
+  assert.equal(app.elements.get('answer-request').disabled, true);
+  const semantic = app.call('search')[1];
+  assert.equal(semantic.args.mode, 'hybrid');
+
+  query.value = '지난 회의 예산';
+  form.dispatch('submit');
+  const nextInstant = app.call('search')[2];
+  semantic.resolve({ results: [searchResult(99, 'stale.txt')] });
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent, /검색 중/);
+  nextInstant.resolve({ results: [searchResult(2, 'budget.txt')] });
+  await flushAsyncWork();
+  const nextSemantic = app.call('search')[3];
+  nextSemantic.resolve({ results: [searchResult(3, 'minutes.txt')] });
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent, /“지난 회의 예산”의 결과 1개/);
+  assert.match(textTree(app.elements.get('results-list')), /minutes\.txt/);
+  assert.doesNotMatch(textTree(app.elements.get('results-list')), /stale\.txt/);
+});
+
 test('explains hybrid versus keyword search and preserves each match signal in result labels', async () => {
   const app = createApp();
   const hint = app.elements.get('search-hint');
@@ -320,6 +424,39 @@ test('restores and saves filename-only folder settings including an empty value'
   app.elements.get('settings-form').dispatch('submit');
   const update = app.call('update_settings')[0];
   assert.equal(update.args.settings.filename_only_dirs, '');
+});
+
+test('keeps Gemma answers and their download option off until enabled', async () => {
+  const app = createApp();
+  app.resolveStatus({
+    settings: { chat_enabled: false, gpu_mode: 'auto' },
+    engine: { embedding_ready: false, chat_ready: false, gpu_backend: 'unavailable' },
+  });
+  await flushAsyncWork();
+  assert.equal(app.elements.get('answer-request').hidden, true);
+  assert.equal(app.elements.get('download-chat').hidden, true);
+  app.elements.get('open-settings').dispatch('click');
+  const settings = app.elements.get('settings-form');
+  const enabled = settings.elements.namedItem('chat_enabled');
+  assert.equal(enabled.checked, false);
+  enabled.checked = true;
+  settings.dispatch('submit');
+  const update = app.call('update_settings')[0];
+  assert.equal(update.args.settings.chat_enabled, true);
+  assert.equal(update.args.settings.gpu_mode, 'auto');
+  update.resolve({});
+  await flushAsyncWork();
+
+  app.resolveStatus({
+    settings: { chat_enabled: true, gpu_mode: 'cpu' },
+    engine: { embedding_ready: false, chat_ready: false, gpu_backend: 'CPU', compute_device: 'CPU', gpu_active: false },
+  });
+  await flushAsyncWork();
+  assert.equal(app.elements.get('answer-request').hidden, false);
+  assert.equal(app.elements.get('answer-request').disabled, true);
+  assert.equal(app.elements.get('download-chat').hidden, false);
+  assert.match(app.elements.get('answer-request').title, /Gemma 4/);
+  assert.match(app.elements.get('engine-message').textContent, /CPU 실행 중/);
 });
 
 test('explains when a selected folder has filename-only indexing', async () => {
