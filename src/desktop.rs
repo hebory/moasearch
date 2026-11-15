@@ -232,8 +232,8 @@ fn create_window(
     let icon = Icon::from_rgba(image.into_raw(), width, height)?;
     let window = WindowBuilder::new()
         .with_title("모아검색")
-        .with_inner_size(LogicalSize::new(1180.0, 800.0))
-        .with_min_inner_size(LogicalSize::new(900.0, 650.0))
+        .with_inner_size(LogicalSize::new(1180.0, 720.0))
+        .with_min_inner_size(LogicalSize::new(860.0, 520.0))
         .with_window_icon(Some(icon))
         .build(target)
         .context("모아검색 창을 만들지 못했습니다.")?;

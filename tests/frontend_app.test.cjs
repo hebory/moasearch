@@ -59,7 +59,8 @@ class Element {
     if (selector === '.result-card') return this.children.filter(child => child.className.includes('result-card'));
     return [];
   }
-  focus() {}
+  focus() { this.focused = true; }
+  select() { this.textSelected = true; }
   scrollIntoView() {}
   showModal() { this.open = true; }
   close() { this.open = false; }
@@ -90,7 +91,7 @@ async function flushAsyncWork() {
 }
 
 function createApp() {
-  const ids = ['root-list','add-root','add-folder-welcome','root-add-dialog','root-add-form','root-add-path','root-add-feedback','root-add-cancel','root-add-submit','root-path-suggestions','rescan-top','quit-app','quit-dialog','cancel-quit','confirm-quit','index-progress','index-progress-track','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-ocr','ocr-status','download-progress','download-progress-fill','download-progress-text','folder-scope','folder-scope-path','folder-scope-note','folder-scope-index','folder-scope-clear','toast'];
+  const ids = ['root-list','add-root','add-folder-welcome','root-add-dialog','root-add-form','root-add-path','root-add-feedback','root-add-cancel','root-add-submit','root-path-suggestions','rescan-top','index-progress','index-progress-track','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-ocr','ocr-status','download-progress','download-progress-fill','download-progress-text','folder-scope','folder-scope-path','folder-scope-note','folder-scope-index','folder-scope-clear','toast'];
   const elements = new Map(ids.map(id => [id, new Element(id === 'query' ? 'input' : 'div')]));
   const submitButton = new Element('button');
   elements.get('settings-form').submitButton = submitButton;
@@ -161,7 +162,7 @@ function createApp() {
       ...overrides,
     });
   }
-  return { elements, calls, call, runTimer, resolveStatus, document, modeButtons };
+  return { elements, calls, call, runTimer, resolveStatus, document, modeButtons, documentListeners };
 }
 
 function searchResult(id, name) {
@@ -171,6 +172,88 @@ function searchResult(id, name) {
 function textTree(node) {
   return [node.textContent || '', ...(node.children || []).map(textTree)].join(' ');
 }
+
+test('opens the current file with Enter and navigates instant results without waiting for AI', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], engine: { embedding_ready: true } });
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  query.value = '작업';
+  app.elements.get('search-form').dispatch('submit');
+  app.call('search')[0].resolve({ results: [searchResult(1, 'first.txt'), searchResult(2, 'second.txt')] });
+  await flushAsyncWork();
+  assert.equal(app.call('search').at(-1).args.mode, 'hybrid');
+  assert.equal(app.call('search').at(-1).isSettled(), false);
+  const rows = app.elements.get('results-list').querySelectorAll('.result-card');
+  assert.equal(rows[0].attributes.get('role'), 'option');
+  assert.equal(rows[0].attributes.get('aria-selected'), 'true');
+  assert.equal(rows[0].children.length, 6, 'the list shows columns rather than body snippets');
+  query.dispatch('keydown', { key: 'ArrowDown' });
+  assert.equal(rows[1].attributes.get('aria-selected'), 'true');
+  query.dispatch('keydown', { key: 'Enter' });
+  assert.equal(app.call('open_file').at(-1).args.id, 2);
+  query.dispatch('keydown', { key: 'Enter', ctrlKey: true });
+  assert.equal(app.call('reveal_file').at(-1).args.id, 2);
+  query.dispatch('keydown', { key: 'ArrowUp' });
+  app.call('file').at(-1).resolve({ ...searchResult(1, 'first.txt'), passages: [{ text: '최신 본문' }] });
+  await flushAsyncWork();
+  app.call('file')[0].resolve({ ...searchResult(1, 'first.txt'), passages: [{ text: '이전 본문' }] });
+  await flushAsyncWork();
+  assert.match(textTree(app.elements.get('preview')), /최신 본문/);
+  assert.doesNotMatch(textTree(app.elements.get('preview')), /이전 본문/, 'a late preview for the same file cannot replace a newer one');
+  rows[0].dispatch('dblclick');
+  assert.equal(app.call('open_file').at(-1).args.id, 1);
+  query.value = '새 검색';
+  query.dispatch('input');
+  const openCount = app.call('open_file').length;
+  query.dispatch('keydown', { key: 'Enter' });
+  assert.equal(app.call('open_file').length, openCount, 'a changed input cannot open an old result');
+});
+
+test('uses desktop search shortcuts without taking focus from a settings dialog', async () => {
+  const app = createApp();
+  app.resolveStatus();
+  await flushAsyncWork();
+  const query = app.elements.get('query');
+  for (const event of [{ key: 'f', ctrlKey: true }, { key: 'F3' }]) {
+    query.focused = false;
+    query.textSelected = false;
+    app.documentListeners.get('keydown')({ ...event, preventDefault() {} });
+    assert.equal(query.focused, true);
+    assert.equal(query.textSelected, true);
+  }
+  query.focused = false;
+  app.elements.get('settings-dialog').open = true;
+  app.documentListeners.get('keydown')({ key: 'f', ctrlKey: true, preventDefault() {} });
+  assert.equal(query.focused, false);
+  const html = fs.readFileSync(path.join(__dirname, '../src/static/index.html'), 'utf8');
+  assert.doesNotMatch(html, /id="(?:quit-dialog|confirm-quit|quit-app)"/, 'the native close button needs no web confirmation');
+});
+
+test('follows the top semantic result until the user explicitly chooses a file', async () => {
+  const app = createApp();
+  app.resolveStatus({ engine: { embedding_ready: true } });
+  await flushAsyncWork();
+  app.elements.get('query').value = '영수증 합치기';
+  app.elements.get('search-form').dispatch('submit');
+  app.call('search')[0].resolve({ results: [searchResult(1, 'instant.txt')] });
+  await flushAsyncWork();
+  app.call('search')[1].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(1, 'instant.txt')] });
+  await flushAsyncWork();
+  assert.equal(app.elements.get('results-list').querySelectorAll('.result-card')[0].attributes.get('aria-selected'), 'true');
+  app.elements.get('query').dispatch('keydown', { key: 'Enter' });
+  assert.equal(app.call('open_file').at(-1).args.id, 2);
+
+  app.elements.get('search-form').dispatch('submit');
+  app.call('search')[2].resolve({ results: [searchResult(1, 'instant.txt'), searchResult(3, 'chosen.txt')] });
+  await flushAsyncWork();
+  app.elements.get('query').dispatch('keydown', { key: 'ArrowDown' });
+  app.call('search')[3].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(3, 'chosen.txt')] });
+  await flushAsyncWork();
+  assert.equal(app.elements.get('results-list').querySelectorAll('.result-card')[1].attributes.get('aria-selected'), 'true');
+  app.elements.get('query').dispatch('keydown', { key: 'Enter' });
+  assert.equal(app.call('open_file').at(-1).args.id, 3, 'semantic refresh preserves a user selection');
+});
 
 test('shows embedding chunk progress together with files scanned', async () => {
   const app = createApp();
@@ -204,9 +287,9 @@ test('reports background filename, body/OCR, and embedding preparation', async (
     });
     await flushAsyncWork();
     assert.match(app.elements.get('progress-label').textContent, phase.expected);
-    assert.match(app.elements.get('engine-message').textContent, phase.phase === 'metadata' ? /파일명 색인 중/ : /파일명 검색 · 위치 등록 대기/);
-    assert.match(app.elements.get('engine-message').textContent, /PP-OCRv5 준비됨/);
-    assert.match(app.elements.get('engine-message').textContent, /EmbeddingGemma 2 Q8_0 · 준비됨/);
+    assert.match(app.elements.get('engine-card').title, phase.phase === 'metadata' ? /파일명 색인 중/ : /파일명 검색 · 위치 등록 대기/);
+    assert.match(app.elements.get('engine-card').title, /PP-OCRv5 준비됨/);
+    assert.equal(app.elements.get('engine-title').textContent, 'EmbeddingGemma 2 Q8_0');
     assert.match(app.elements.get('engine-message').textContent, /CUDA 모델 로드됨 · GPU 층 0개/);
   }
 });
@@ -315,7 +398,7 @@ test('disables stale questions immediately and only enables them after the lates
   await flushAsyncWork();
   assert.equal(question.disabled, true, 'a stale response cannot re-enable the question button');
 
-  app.runTimer(500);
+  app.runTimer(160);
   const thirdSearch = app.call('search')[2];
   assert.equal(question.disabled, true, 'question remains disabled during the replacement search');
   thirdSearch.resolve({ results: [searchResult(3, 'third.txt')] });
@@ -380,7 +463,7 @@ test('shows instant lexical matches before hybrid results and ignores a stale se
 test('explains hybrid versus keyword search and preserves each match signal in result labels', async () => {
   const app = createApp();
   const hint = app.elements.get('search-hint');
-  assert.match(hint.textContent, /의미 유사 검색은 입력한 단어가 없는 문서도 찾을 수/);
+  assert.match(hint.textContent, /의미 검색은 검색어가 없는 문서도 포함/);
   app.modeButtons[1].dispatch('click');
   assert.match(hint.textContent, /파일명·경로와 본문에서 찾습니다/);
 
