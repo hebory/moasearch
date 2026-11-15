@@ -79,6 +79,17 @@ test('passes only file-list pagination fields through the native bridge', async 
   await assert.rejects(bridge.window.moa.invoke('list_files', { query: 'x' }), /형식이 올바르지/);
 });
 
+test('passes search snapshot cursors and rejects fields outside paged search', async () => {
+  const bridge = createBridge();
+  const cursor = { snapshot_id: 'test-search', offset: 200, revision: 7 };
+  const pending = bridge.window.moa.invoke('search_page', { query: '보고서', limit: 200, mode: 'keyword', folder: null, extension: null, cursor });
+  assert.equal(bridge.messages[0].command, 'search_page');
+  assert.deepEqual(bridge.messages[0].args.cursor, cursor);
+  respond(bridge, bridge.messages[0], { ok: true, value: { results: [], total: 900, next_cursor: null } });
+  assert.equal((await pending).total, 900);
+  await assert.rejects(bridge.window.moa.invoke('search_page', { query: 'x', sql: 'SELECT 1' }), /형식이 올바르지/);
+});
+
 test('ignores responses from another window session', async () => {
   const bridge = createBridge();
   const pending = bridge.window.moa.invoke('status');

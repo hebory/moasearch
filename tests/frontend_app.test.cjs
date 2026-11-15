@@ -192,10 +192,10 @@ test('opens the current file with Enter and navigates instant results without wa
   const query = app.elements.get('query');
   query.value = '작업';
   app.elements.get('search-form').dispatch('submit');
-  app.call('search')[0].resolve({ results: [searchResult(1, 'first.txt'), searchResult(2, 'second.txt')] });
+  app.call('search_page')[0].resolve({ results: [searchResult(1, 'first.txt'), searchResult(2, 'second.txt')] });
   await flushAsyncWork();
-  assert.equal(app.call('search').at(-1).args.mode, 'hybrid');
-  assert.equal(app.call('search').at(-1).isSettled(), false);
+  assert.equal(app.call('search_page').at(-1).args.mode, 'hybrid');
+  assert.equal(app.call('search_page').at(-1).isSettled(), false);
   const rows = app.elements.get('results-list').querySelectorAll('.result-card');
   assert.equal(rows[0].attributes.get('role'), 'option');
   assert.equal(rows[0].attributes.get('aria-selected'), 'true');
@@ -322,6 +322,26 @@ test('loads the blank-query file list in cursor pages while virtual rows preserv
   assert.match(textTree(list), /file-0501/);
 });
 
+test('scroll events virtualize fully loaded browse and search result sets without requesting another page', async () => {
+  const browseApp=createApp();browseApp.resolveStatus({roots:[{id:1,path:'C:\\docs'}]});await flushAsyncWork();
+  browseApp.call('list_files')[0].resolve({results:Array.from({length:80},(_,index)=>listResult(index+1)),total:80,next_cursor:null,revision:1});await flushAsyncWork();
+  const browseList=browseApp.elements.get('results-list');browseList.scrollHeight=80*29;browseList.scrollTop=80*29-browseList.clientHeight;browseList.dispatch('scroll');
+  assert.ok(browseList.querySelectorAll('.result-card').some(row=>row.getAttribute('data-result-id')==='80'),'the final browse rows mount after scrolling');
+  browseList.scrollTop=0;browseList.dispatch('scroll');
+  assert.ok(browseList.querySelectorAll('.result-card').some(row=>row.getAttribute('data-result-id')==='1'),'the first browse rows remount when scrolling to the top');
+  assert.equal(browseApp.call('list_files').length,1,'a completed browse result set does not request another page');
+
+  const searchApp=createApp();searchApp.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  searchApp.modeButtons.find(button=>button.dataset.mode==='keyword').dispatch('click');
+  searchApp.elements.get('query').value='완료된 검색';searchApp.elements.get('query').dispatch('input');
+  searchApp.call('search_page')[0].resolve({results:Array.from({length:80},(_,index)=>searchResult(index+1,`match-${String(index+1).padStart(3,'0')}.txt`)),total:80,next_cursor:null,revision:1,mode:'keyword'});await flushAsyncWork();
+  const searchList=searchApp.elements.get('results-list');searchList.scrollHeight=80*29;searchList.scrollTop=80*29-searchList.clientHeight;searchList.dispatch('scroll');
+  assert.ok(searchList.querySelectorAll('.result-card').some(row=>row.getAttribute('data-result-id')==='80'),'the final search rows mount after scrolling');
+  searchList.scrollTop=0;searchList.dispatch('scroll');
+  assert.ok(searchList.querySelectorAll('.result-card').some(row=>row.getAttribute('data-result-id')==='1'),'the first search rows remount when scrolling to the top');
+  assert.equal(searchApp.call('search_page').length,1,'a completed search result set does not request another page');
+});
+
 test('index completion refreshes folder scope without resetting a stable browse list', async () => {
   const app = createApp();
   app.resolveStatus({
@@ -356,35 +376,207 @@ test('coalesces immediate lexical input, delays hybrid, and ignores stale respon
   const query = app.elements.get('query');
   query.value = '계';
   query.dispatch('input');
-  assert.equal(app.call('search').length, 1, 'the first character is searched immediately');
-  const first = app.call('search')[0];
+  assert.equal(app.call('search_page').length, 1, 'the first character is searched immediately');
+  const first = app.call('search_page')[0];
   assert.equal(first.args.mode, 'instant');
   query.value = '계약';
   query.dispatch('input');
   query.value = '계약서';
   query.dispatch('input');
-  assert.equal(app.call('search').length, 1, 'rapid keystrokes are coalesced behind the active request');
+  assert.equal(app.call('search_page').length, 1, 'rapid keystrokes are coalesced behind the active request');
   first.resolve({ results: [searchResult(99, 'stale.txt')] });
   await flushAsyncWork();
-  const latest = app.call('search')[1];
+  const latest = app.call('search_page')[1];
   assert.equal(latest.args.query, '계약서');
   assert.doesNotMatch(textTree(app.elements.get('results-list')), /stale\.txt/);
   latest.resolve({ results: [searchResult(1, 'contract.txt')] });
   await flushAsyncWork();
-  assert.equal(app.call('search').length, 2);
+  assert.equal(app.call('search_page').length, 2);
   app.runTimer(200);
   await flushAsyncWork();
-  assert.equal(app.call('search').length, 3, 'the hybrid timer reuses a completed instant request instead of sending it again');
+  assert.equal(app.call('search_page').length, 3, 'the hybrid timer reuses a completed instant request instead of sending it again');
   app.elements.get('search-form').dispatch('submit');
   await flushAsyncWork();
-  assert.equal(app.call('search').length, 3, 'repeated Enter while hybrid search is pending reuses its in-flight request');
-  const hybrid = app.call('search')[2];
+  assert.equal(app.call('search_page').length, 3, 'repeated Enter while hybrid search is pending reuses its in-flight request');
+  const hybrid = app.call('search_page')[2];
   assert.equal(hybrid.args.mode, 'hybrid');
   assert.equal(hybrid.args.query, '계약서');
   hybrid.resolve({ results: [searchResult(2, 'semantic-contract.txt')] });
   await flushAsyncWork();
   assert.match(textTree(app.elements.get('results-list')), /semantic-contract\.txt/);
   assert.doesNotMatch(textTree(app.elements.get('results-list')), /stale\.txt/);
+});
+
+test('paginates all matching keyword results while keeping the search list virtualized', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], engine: { embedding_ready: false } });
+  await flushAsyncWork();
+  app.modeButtons.find(button => button.dataset.mode === 'keyword').dispatch('click');
+  const query = app.elements.get('query');query.value='보고서';query.dispatch('input');
+  const first = app.call('search_page')[0];
+  assert.equal(first.args.mode,'keyword');assert.equal(first.args.limit,200);assert.equal(first.args.cursor,null);
+  const cursor={snapshot_id:'snapshot-a',offset:200,revision:4};
+  first.resolve({results:Array.from({length:200},(_,index)=>listResult(index+1)),total:450,next_cursor:cursor,revision:4,mode:'keyword',intent:null,warnings:[]});
+  await flushAsyncWork();
+  const list=app.elements.get('results-list');
+  assert.match(app.elements.get('results-title').textContent,/450개 · 200개 불러옴/);
+  assert.ok(list.querySelectorAll('.result-card').length<=100,'search results use bounded virtual DOM');
+  list.scrollHeight=200*29;list.scrollTop=200*29-list.clientHeight-10;list.dispatch('scroll');
+  const second=app.call('search_page')[1];assert.deepEqual(second.args.cursor,cursor);assert.equal(second.args.mode,'keyword');
+  const selected=list.querySelectorAll('.result-card').find(row=>row.getAttribute('data-result-id')==='200');assert.ok(selected);selected.dispatch('click');selected.focus();
+  second.resolve({results:Array.from({length:200},(_,index)=>listResult(index+201)),total:450,next_cursor:{snapshot_id:'snapshot-a',offset:400,revision:4},revision:4,mode:'keyword',intent:null,warnings:[]});
+  await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent,/450개 · 400개 불러옴/);
+  assert.equal(list.scrollTop,200*29-list.clientHeight-10,'appending a result page preserves the viewport');
+  assert.ok(list.querySelectorAll('.result-card').length<=100);
+  assert.equal(app.document.activeElement,selected,'appending preserves focused row');
+  assert.equal(app.call('file').at(-1).args.id,200,'appending does not change the selected preview');
+  list.scrollHeight=400*29;list.scrollTop=400*29-list.clientHeight-1;list.dispatch('scroll');
+  const third=app.call('search_page')[2];assert.deepEqual(third.args.cursor,{snapshot_id:'snapshot-a',offset:400,revision:4});
+  third.resolve({results:Array.from({length:50},(_,index)=>listResult(index+401)),total:450,next_cursor:null,revision:4,mode:'keyword'});await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent,/450개 · 450개 불러옴/);
+  assert.ok(list.querySelectorAll('.result-card').length<=100);
+});
+
+test('ArrowDown on the last search result loads and selects the next cursor page', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  app.modeButtons.find(button=>button.dataset.mode==='keyword').dispatch('click');
+  const query=app.elements.get('query');query.value='다음 문서';query.dispatch('input');
+  app.call('search_page')[0].resolve({results:[searchResult(1,'first.txt')],total:2,next_cursor:{snapshot_id:'keyboard',offset:200,revision:1},revision:1,mode:'keyword'});await flushAsyncWork();
+  query.dispatch('keydown',{key:'ArrowDown'});
+  const next=app.call('search_page')[1];assert.equal(next.args.cursor.snapshot_id,'keyboard');
+  next.resolve({results:[searchResult(2,'second.txt')],total:2,next_cursor:null,revision:1,mode:'keyword'});await flushAsyncWork();
+  const selected=app.elements.get('results-list').querySelectorAll('.result-card').find(row=>row.getAttribute('aria-selected')==='true');
+  assert.equal(selected.getAttribute('data-result-id'),'2');assert.equal(app.call('file').at(-1).args.id,2);
+});
+
+test('hybrid replacement invalidates in-flight instant pages and preserves selected files only when present', async () => {
+  const app = createApp();
+  app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], engine: { embedding_ready: true } });
+  await flushAsyncWork();
+  const query=app.elements.get('query');query.value='찾을 자료';query.dispatch('input');
+  const instant=app.call('search_page')[0];
+  instant.resolve({results:[searchResult(1,'instant-top.txt'),searchResult(2,'chosen.txt')],total:300,next_cursor:{snapshot_id:'instant-snapshot',offset:200,revision:5},revision:5,mode:'instant'});
+  await flushAsyncWork();
+  const rows=app.elements.get('results-list').querySelectorAll('.result-card');rows.find(row=>row.getAttribute('data-result-id')==='2').dispatch('click');
+
+  const list=app.elements.get('results-list');list.scrollHeight=list.clientHeight;list.scrollTop=0;list.dispatch('scroll');
+  const staleInstantPage=app.call('search_page')[1];assert.equal(staleInstantPage.args.mode,'instant');
+  app.runTimer(200);await flushAsyncWork();
+  const hybrid=app.call('search_page')[2];assert.equal(hybrid.args.mode,'hybrid');assert.equal(hybrid.args.cursor,null);
+  hybrid.resolve({results:[searchResult(9,'semantic-top.txt'),searchResult(2,'chosen.txt')],total:260,next_cursor:{snapshot_id:'hybrid-snapshot',offset:200,revision:6},revision:6,mode:'hybrid'});
+  await flushAsyncWork();
+  assert.equal(list.scrollTop,0,'a ranking phase change restarts at the top');
+  assert.doesNotMatch(textTree(list),/instant-top\.txt/);
+  assert.equal(list.querySelectorAll('.result-card').find(row=>row.getAttribute('aria-selected')==='true').getAttribute('data-result-id'),'2','an explicit selection in the hybrid page is retained');
+
+  staleInstantPage.resolve({results:[searchResult(8,'stale-instant-page.txt')],total:300,next_cursor:null,revision:5,mode:'instant'});
+  await flushAsyncWork();
+  assert.doesNotMatch(textTree(list),/stale-instant-page/,'late old-phase pages cannot append to hybrid results');
+  list.scrollHeight=list.clientHeight;list.scrollTop=0;list.dispatch('scroll');
+  const hybridNext=app.call('search_page')[3];assert.equal(hybridNext.args.mode,'hybrid');assert.deepEqual(hybridNext.args.cursor,{snapshot_id:'hybrid-snapshot',offset:200,revision:6});
+  hybridNext.resolve({results:[searchResult(10,'semantic-next.txt')],total:260,next_cursor:null,revision:6,mode:'hybrid'});
+  await flushAsyncWork();
+  assert.match(textTree(list),/semantic-next\.txt/);
+  assert.doesNotMatch(textTree(list),/instant-top\.txt|stale-instant-page/);
+});
+
+test('hybrid replacement rebuilds same-ID rows with current metadata and match labels', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:true}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='프로젝트 자료';query.dispatch('input');
+  app.call('search_page')[0].resolve({results:[{...searchResult(7,'old-name.txt'),path:'C:\\old\\old-name.txt',match_type:'filename'}],total:1,revision:1,mode:'instant'});await flushAsyncWork();
+  const oldRow=app.elements.get('results-list').querySelectorAll('.result-card')[0];
+  assert.match(textTree(oldRow),/old-name\.txt/);
+  app.runTimer(200);await flushAsyncWork();
+  app.call('search_page')[1].resolve({results:[{...searchResult(7,'new-name.txt'),path:'D:\\new\\new-name.txt',match_type:'keyword+semantic'}],total:1,revision:1,mode:'hybrid'});await flushAsyncWork();
+  const row=app.elements.get('results-list').querySelectorAll('.result-card')[0];
+  assert.notEqual(row,oldRow,'a changed result object must not reuse the prior row');
+  assert.match(textTree(row),/new-name\.txt/);assert.match(textTree(row),/D:\\new\\new-name\.txt/);
+  assert.match(textTree(row),/본문 키워드 \+ 의미 유사/);
+  assert.equal(row.resultRecord.path,'D:\\new\\new-name.txt');
+  row.dispatch('click');assert.equal(app.call('file').at(-1).args.id,7,'the replacement row has an active handler for the new result');
+});
+
+test('restarts search pagination from page one when the snapshot revision changes', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='회의';query.dispatch('input');
+  app.call('search_page')[0].resolve({results:[searchResult(1,'first.txt')],total:500,next_cursor:{snapshot_id:'old',offset:200,revision:1},revision:1,mode:'instant'});await flushAsyncWork();
+  const list=app.elements.get('results-list');list.scrollHeight=list.clientHeight;list.scrollTop=0;list.dispatch('scroll');
+  app.call('search_page')[1].resolve({results:[],total:510,next_cursor:null,revision:2,reset_required:true,mode:'instant'});await flushAsyncWork();
+  const restarted=app.call('search_page')[2];assert.equal(restarted.args.cursor,null);assert.equal(restarted.args.mode,'instant');
+  assert.doesNotMatch(textTree(list),/first\.txt/,'old snapshot rows are cleared while the first page reloads');
+  restarted.resolve({results:[searchResult(5,'revised.txt')],total:510,next_cursor:null,revision:2,mode:'instant'});await flushAsyncWork();
+  assert.match(textTree(list),/revised\.txt/);assert.doesNotMatch(textTree(list),/first\.txt/);
+});
+
+test('retries hybrid first page when an instant snapshot reset changes its epoch', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:true}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='업데이트된 자료';query.dispatch('input');
+  app.call('search_page')[0].resolve({results:[searchResult(1,'instant-old.txt')],total:500,next_cursor:{snapshot_id:'instant-old',offset:200,revision:1},revision:1,mode:'instant'});await flushAsyncWork();
+  const list=app.elements.get('results-list');list.scrollHeight=list.clientHeight;list.scrollTop=0;list.dispatch('scroll');
+  const instantContinuation=app.call('search_page')[1];
+  app.runTimer(200);await flushAsyncWork();
+  const oldHybrid=app.call('search_page')[2];assert.equal(oldHybrid.args.mode,'hybrid');
+
+  instantContinuation.resolve({results:[],total:510,next_cursor:null,revision:2,reset_required:true,mode:'instant'});await flushAsyncWork();
+  const restartedInstant=app.call('search_page')[3];assert.equal(restartedInstant.args.cursor,null);assert.equal(restartedInstant.args.mode,'instant');
+  restartedInstant.resolve({results:[searchResult(3,'instant-current.txt')],total:510,next_cursor:{snapshot_id:'instant-new',offset:200,revision:2},revision:2,mode:'instant'});await flushAsyncWork();
+  assert.match(textTree(list),/instant-current\.txt/);
+
+  oldHybrid.resolve({results:[searchResult(8,'stale-hybrid.txt')],total:400,next_cursor:null,revision:1,mode:'hybrid'});await flushAsyncWork();
+  const currentHybrid=app.call('search_page')[4];assert.equal(currentHybrid.args.mode,'hybrid');assert.equal(currentHybrid.args.cursor,null,'a changed epoch restarts hybrid at its first page');
+  assert.match(textTree(list),/instant-current\.txt/);assert.doesNotMatch(textTree(list),/stale-hybrid\.txt/);
+  currentHybrid.resolve({results:[searchResult(9,'hybrid-current.txt')],total:390,next_cursor:null,revision:2,mode:'hybrid'});await flushAsyncWork();
+  assert.match(textTree(list),/hybrid-current\.txt/);assert.doesNotMatch(textTree(list),/instant-current\.txt|stale-hybrid\.txt/);
+});
+
+test('search page responses become stale after extension changes and clearing the query', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='초안';query.dispatch('input');const staleFilter=app.call('search_page')[0];
+  app.elements.get('extension-filter').value='pdf';app.elements.get('extension-filter').dispatch('change');
+  staleFilter.resolve({results:[searchResult(1,'old.txt')],total:1,revision:1,mode:'instant'});await flushAsyncWork();
+  const filtered=app.call('search_page')[1];assert.equal(filtered.args.extension,'pdf');
+  assert.doesNotMatch(textTree(app.elements.get('results-list')),/old\.txt/);
+  filtered.resolve({results:[searchResult(2,'filtered.pdf')],total:1,revision:2,mode:'instant'});await flushAsyncWork();
+
+  query.value='오래된 요청';query.dispatch('input');const staleClear=app.call('search_page')[2];
+  query.value='';query.dispatch('input');const browse=app.call('list_files').at(-1);
+  browse.resolve({results:[listResult(8)],total:1,next_cursor:null,revision:3});await flushAsyncWork();
+  staleClear.resolve({results:[searchResult(9,'stale-after-clear.txt')],total:1,revision:2,mode:'instant'});await flushAsyncWork();
+  assert.match(textTree(app.elements.get('results-list')),/file-0008/);
+  assert.doesNotMatch(textTree(app.elements.get('results-list')),/filtered\.pdf|stale-after-clear/);
+});
+
+test('retries a failed search continuation at the same cursor without losing prior matches', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='계약';query.dispatch('input');
+  const cursor={snapshot_id:'search-snapshot',offset:200,revision:12};
+  app.call('search_page')[0].resolve({results:Array.from({length:200},(_,index)=>listResult(index+1)),total:350,next_cursor:cursor,revision:12,mode:'instant'});await flushAsyncWork();
+  const list=app.elements.get('results-list');list.scrollHeight=200*29;list.scrollTop=200*29-list.clientHeight-1;list.dispatch('scroll');
+  app.call('search_page')[1].reject(new Error('transient page error'));await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent,/350개 · 200개 불러옴/);assert.match(textTree(list),/다시 불러오기/);assert.equal(app.call('file').at(-1).args.id,1);
+  function findRetry(node){if(node.tagName==='BUTTON'&&node.textContent==='다시 불러오기')return node;for(const child of node.children||[]){const found=findRetry(child);if(found)return found;}return null;}
+  findRetry(list).dispatch('click');
+  const retry=app.call('search_page')[2];assert.deepEqual(retry.args.cursor,cursor);assert.equal(retry.args.mode,'instant');
+  retry.resolve({results:Array.from({length:150},(_,index)=>listResult(index+201)),total:350,next_cursor:null,revision:12,mode:'instant'});await flushAsyncWork();
+  assert.match(app.elements.get('results-title').textContent,/350개 · 350개 불러옴/);
+  list.scrollTop=0;app.windowListeners.get('resize')();assert.match(textTree(list),/file-0001/);assert.ok(list.querySelectorAll('.result-card').length<=100);
+});
+
+test('stops repeated search cursors and offers a bounded first-page restart', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  const query=app.elements.get('query');query.value='반복 결과';query.dispatch('input');
+  const cursor={snapshot_id:'loop',offset:200,revision:1};
+  app.call('search_page')[0].resolve({results:[searchResult(1,'same.txt')],total:3,next_cursor:cursor,revision:1,mode:'instant'});await flushAsyncWork();
+  const list=app.elements.get('results-list');list.scrollHeight=list.clientHeight;list.scrollTop=0;list.dispatch('scroll');
+  app.call('search_page')[1].resolve({results:[searchResult(1,'same.txt')],total:3,next_cursor:cursor,revision:1,mode:'instant'});await flushAsyncWork();
+  list.dispatch('scroll');assert.equal(app.call('search_page').length,2,'the duplicate cursor is not followed automatically');
+  assert.match(textTree(list),/다시 불러오기/);
+  function findRetry(node){if(node.tagName==='BUTTON'&&node.textContent==='다시 불러오기')return node;for(const child of node.children||[]){const found=findRetry(child);if(found)return found;}return null;}
+  findRetry(list).dispatch('click');
+  const restart=app.call('search_page')[2];assert.equal(restart.args.cursor,null);assert.equal(restart.args.mode,'instant');
+  restart.resolve({results:[searchResult(2,'restarted.txt')],total:3,next_cursor:null,revision:2,mode:'instant'});await flushAsyncWork();
+  assert.match(textTree(list),/restarted\.txt/);assert.doesNotMatch(textTree(list),/same\.txt/);
 });
 
 test('an old browse ArrowDown continuation cannot change selection after a new search', async () => {
@@ -398,7 +590,7 @@ test('an old browse ArrowDown continuation cannot change selection after a new s
   const olderPage = app.call('list_files')[1];
   app.elements.get('query').value = '새 검색';
   app.elements.get('query').dispatch('input');
-  app.call('search')[0].resolve({ results: [searchResult(70, '새결과.txt'), searchResult(71, '다른결과.txt')] });
+  app.call('search_page')[0].resolve({ results: [searchResult(70, '새결과.txt'), searchResult(71, '다른결과.txt')] });
   await flushAsyncWork();
   assert.equal(app.call('file').at(-1).args.id, 70);
 
@@ -456,12 +648,12 @@ test('IME composition sends one completed query and composition Enter never open
   query.value = '회의';
   query.dispatch('input', { isComposing: true });
   query.dispatch('keydown', { key: 'Enter', isComposing: true, keyCode: 229 });
-  assert.equal(app.call('search').length, 0, 'IME intermediate text is not sent');
+  assert.equal(app.call('search_page').length, 0, 'IME intermediate text is not sent');
   assert.equal(app.call('open_file').length, 0, 'IME confirm Enter does not open a file');
   query.dispatch('compositionend');
   query.dispatch('input', { isComposing: false });
-  assert.equal(app.call('search').length, 1, 'compositionend dispatches one immediate lexical search');
-  assert.equal(app.call('search')[0].args.query, '회의');
+  assert.equal(app.call('search_page').length, 1, 'compositionend dispatches one immediate lexical search');
+  assert.equal(app.call('search_page')[0].args.query, '회의');
 });
 
 test('filter and scope changes invalidate prior browse pages and reload the right folder', async () => {
@@ -501,9 +693,9 @@ test('follows the top semantic result until the user explicitly chooses a file',
   await flushAsyncWork();
   app.elements.get('query').value = '영수증 합치기';
   app.elements.get('search-form').dispatch('submit');
-  app.call('search')[0].resolve({ results: [searchResult(1, 'instant.txt')] });
+  app.call('search_page')[0].resolve({ results: [searchResult(1, 'instant.txt')] });
   await flushAsyncWork();
-  app.call('search')[1].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(1, 'instant.txt')] });
+  app.call('search_page')[1].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(1, 'instant.txt')] });
   await flushAsyncWork();
   assert.equal(app.elements.get('results-list').querySelectorAll('.result-card')[0].attributes.get('aria-selected'), 'true');
   app.elements.get('query').dispatch('keydown', { key: 'Enter' });
@@ -511,12 +703,12 @@ test('follows the top semantic result until the user explicitly chooses a file',
 
   app.elements.get('query').value = '영수증 합치기 추가';
   app.elements.get('query').dispatch('input');
-  app.call('search')[2].resolve({ results: [searchResult(1, 'instant.txt'), searchResult(3, 'chosen.txt')] });
+  app.call('search_page')[2].resolve({ results: [searchResult(1, 'instant.txt'), searchResult(3, 'chosen.txt')] });
   await flushAsyncWork();
   app.elements.get('query').dispatch('keydown', { key: 'ArrowDown' });
   app.runTimer(200);
   await flushAsyncWork();
-  app.call('search')[3].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(3, 'chosen.txt')] });
+  app.call('search_page')[3].resolve({ results: [searchResult(2, 'semantic.txt'), searchResult(3, 'chosen.txt')] });
   await flushAsyncWork();
   assert.equal(app.elements.get('results-list').querySelectorAll('.result-card')[1].attributes.get('aria-selected'), 'true');
   app.elements.get('query').dispatch('keydown', { key: 'Enter' });
@@ -637,7 +829,7 @@ test('disables stale questions immediately and only enables them after the lates
 
   query.value = '첫 검색';
   form.dispatch('submit');
-  const firstSearch = app.call('search')[0];
+  const firstSearch = app.call('search_page')[0];
   assert.equal(question.disabled, true, 'question stays disabled while a search is pending');
   firstSearch.resolve({ results: [searchResult(1, 'first.txt')] });
   await flushAsyncWork();
@@ -659,14 +851,14 @@ test('disables stale questions immediately and only enables them after the lates
   assert.equal(app.call('answer').length, 1, 'a stale question cannot be submitted during debounce');
 
   form.dispatch('submit');
-  const secondSearch = app.call('search')[1];
+  const secondSearch = app.call('search_page')[1];
   query.value = '세 번째 검색';
   query.dispatch('input');
   secondSearch.resolve({ results: [searchResult(2, 'stale.txt')] });
   await flushAsyncWork();
   assert.equal(question.disabled, true, 'a stale response cannot re-enable the question button');
 
-  const thirdSearch = app.call('search')[2];
+  const thirdSearch = app.call('search_page')[2];
   assert.equal(question.disabled, true, 'question remains disabled during the replacement search');
   thirdSearch.resolve({ results: [searchResult(3, 'third.txt')] });
   await flushAsyncWork();
@@ -675,14 +867,14 @@ test('disables stale questions immediately and only enables them after the lates
   query.value = '네 번째 검색';
   query.dispatch('input');
   form.dispatch('submit');
-  const fourthSearch = app.call('search')[3];
+  const fourthSearch = app.call('search_page')[3];
   query.value = '다섯 번째 검색';
   query.dispatch('input');
   form.dispatch('submit');
-  assert.equal(app.call('search').length, 4, 'only one fast search is in flight while the latest input is coalesced');
+  assert.equal(app.call('search_page').length, 4, 'only one fast search is in flight while the latest input is coalesced');
   fourthSearch.resolve({ results: [] });
   await flushAsyncWork();
-  const fifthSearch = app.call('search')[4];
+  const fifthSearch = app.call('search_page')[4];
   assert.equal(fifthSearch.args.query, '다섯 번째 검색');
   fifthSearch.resolve({ results: [searchResult(5, 'fifth.txt')] });
   await flushAsyncWork();
@@ -703,25 +895,25 @@ test('shows instant lexical matches before hybrid results and ignores a stale se
   const form = app.elements.get('search-form');
   query.value = '계약 갱신 기간';
   form.dispatch('submit');
-  const instant = app.call('search')[0];
+  const instant = app.call('search_page')[0];
   assert.equal(instant.args.mode, 'instant');
   instant.resolve({ results: [searchResult(1, 'contract.txt')] });
   await flushAsyncWork();
-  assert.match(app.elements.get('results-title').textContent, /파일명·키워드 결과 1개 · 의미 검색 중/);
-  assert.match(textTree(app.elements.get('results-list')), /결과를 먼저 보여드리고/);
+  assert.match(app.elements.get('results-title').textContent, /“계약 갱신 기간”의 결과 1개 · 1개 불러옴 · 의미 검색 중/);
+  assert.match(app.elements.get('search-hint').textContent, /결과를 먼저 보여드리고/);
   assert.equal(app.elements.get('answer-request').disabled, true);
-  const semantic = app.call('search')[1];
+  const semantic = app.call('search_page')[1];
   assert.equal(semantic.args.mode, 'hybrid');
 
   query.value = '지난 회의 예산';
   form.dispatch('submit');
-  const nextInstant = app.call('search')[2];
+  const nextInstant = app.call('search_page')[2];
   semantic.resolve({ results: [searchResult(99, 'stale.txt')] });
   await flushAsyncWork();
   assert.match(app.elements.get('results-title').textContent, /찾는 중/);
   nextInstant.resolve({ results: [searchResult(2, 'budget.txt')] });
   await flushAsyncWork();
-  const nextSemantic = app.call('search')[3];
+  const nextSemantic = app.call('search_page')[3];
   nextSemantic.resolve({ results: [searchResult(3, 'minutes.txt')] });
   await flushAsyncWork();
   assert.match(app.elements.get('results-title').textContent, /“지난 회의 예산”의 결과 1개/);
@@ -741,7 +933,7 @@ test('explains hybrid versus keyword search and preserves each match signal in r
   const query = app.elements.get('query');
   query.value = '표시 신호';
   app.elements.get('search-form').dispatch('submit');
-  const request = app.call('search')[0];
+  const request = app.call('search_page')[0];
   assert.equal(request.args.mode, 'keyword');
   request.resolve({ intent: 'source_code', results: [
     { ...searchResult(1, 'filename.txt'), match_type: 'filename' },
@@ -817,7 +1009,7 @@ test('explains when a selected folder has filename-only indexing', async () => {
   await flushAsyncWork();
   app.elements.get('query').value = '배포 파일';
   app.elements.get('search-form').dispatch('submit');
-  app.call('search')[0].resolve({ results: [searchResult(14, 'index.html')] });
+  app.call('search_page')[0].resolve({ results: [searchResult(14, 'index.html')] });
   await flushAsyncWork();
   app.call('file')[0].resolve({
     ...searchResult(14, 'index.html'),
@@ -839,7 +1031,7 @@ test('answer request rechecks the live input against the completed search query'
 
   query.value = '검색어';
   form.dispatch('submit');
-  app.call('search')[0].resolve({ results: [searchResult(1, 'result.txt')] });
+  app.call('search_page')[0].resolve({ results: [searchResult(1, 'result.txt')] });
   await flushAsyncWork();
   assert.equal(question.disabled, false);
 

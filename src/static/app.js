@@ -3,7 +3,7 @@
   const $ = (selector, scope = document) => scope.querySelector(selector);
   const dom = Object.fromEntries(['root-list','add-root','add-folder-welcome','root-add-dialog','root-add-form','root-add-path','root-add-feedback','root-add-cancel','root-add-submit','root-path-suggestions','rescan-top','index-progress','index-progress-track','progress-label','progress-detail','cancel-index','engine-card','engine-title','engine-message','open-settings','search-form','query','search-hint','results-view','welcome','library-idle','idle-title','idle-message','start-index-empty','results-title','results-list','preview','extension-filter','answer-request','answer-view','answer-text','answer-sources','answer-state','library-summary','settings-dialog','settings-form','settings-feedback','download-embedding','download-chat','download-ocr','ocr-status','download-progress','download-progress-fill','download-progress-text','folder-scope','folder-scope-path','folder-scope-note','folder-scope-index','folder-scope-clear','toast'].map(id => [id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), document.getElementById(id)]));
   dom.answerRequest.disabled = true;
-  const state = {roots:[], status:null, results:[], selected:null, selectionExplicit:false, mode:'hybrid', view:'browse', query:'', extension:'', searchTimer:0, hybridTimer:0, pollTimer:0, toastTimer:0, searchSequence:0, viewGeneration:0, answerSequence:0, scopeSequence:0, previewSequence:0, searchPending:false, folder:null, browse:{items:[],total:0,nextCursor:null,revision:null,loading:false,failed:false}, browseGeneration:0, virtualStart:0, virtualRowHeight:29, composing:false, instantInFlight:null, instantQueued:null, instantCompleted:null, hybridInFlight:null, addingRoot:false, indexingScope:false, closed:false, reportedIndexError:'', modelDownload:null, modelDownloadKind:'', reportedDownloadError:''};
+  const state = {roots:[], status:null, results:[], selected:null, selectionExplicit:false, mode:'hybrid', view:'browse', query:'', extension:'', searchTimer:0, hybridTimer:0, pollTimer:0, toastTimer:0, searchSequence:0, viewGeneration:0, answerSequence:0, scopeSequence:0, previewSequence:0, searchPending:false, folder:null, browse:{items:[],total:0,nextCursor:null,revision:null,loading:false,failed:false}, searchPages:{items:[],total:0,nextCursor:null,revision:null,loading:false,failed:false,phase:null,epoch:0,query:'',warnings:[],intent:null}, browseGeneration:0, virtualStart:0, virtualRowHeight:29, composing:false, instantInFlight:null, instantQueued:null, instantCompleted:null, hybridInFlight:null, addingRoot:false, indexingScope:false, closed:false, reportedIndexError:'', modelDownload:null, modelDownloadKind:'', reportedDownloadError:''};
   const esc = value => String(value ?? '');
   function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = esc(text); return node; }
   function toast(message,error=false) { clearTimeout(state.toastTimer); dom.toast.textContent=message;dom.toast.classList.toggle('error',error);dom.toast.classList.add('show');state.toastTimer=setTimeout(()=>dom.toast.classList.remove('show'),3600); }
@@ -87,6 +87,8 @@
   }
   function currentFolderPath() { return state.folder?.path&&!state.folder.pending&&!state.folder.error?state.folder.path:null; }
   function currentBrowse(generation=state.viewGeneration) { return !state.closed&&state.view==='browse'&&generation===state.viewGeneration&&!dom.query.value.trim()&&!state.folder?.pending&&!state.folder?.error; }
+  function currentSearchPages(generation=state.viewGeneration,epoch=state.searchPages.epoch) { return !state.closed&&state.view==='search'&&generation===state.viewGeneration&&epoch===state.searchPages.epoch&&dom.query.value.trim()===state.query&&state.searchPages.query===state.query&&!state.folder?.pending&&!state.folder?.error; }
+  function currentResultPage() { return state.view==='search'?state.searchPages:state.browse; }
   function updateBrowseTitle() {
     const count=state.browse.items.length,total=state.browse.total;
     dom.resultsTitle.textContent=state.browse.loading?`파일 ${total||count}개 · ${count}개 불러옴 · 더 불러오는 중…`:total?`파일 ${total}개 · ${count}개 불러옴`:state.browse.failed?'파일 목록을 불러오지 못했어요':'파일 0개';
@@ -94,8 +96,38 @@
   function browseRetryButton() {
     const button=element('button','secondary-button','다시 불러오기');button.type='button';button.addEventListener('click',()=>{if(!state.browse.failed||state.browse.loading)return;const reset=state.browse.items.length===0;state.browse.failed=false;loadBrowsePage(reset,state.viewGeneration);});return button;
   }
+  function searchRetryButton() {
+    const button=element('button','secondary-button','다시 불러오기');button.type='button';button.addEventListener('click',()=>{
+      const page=state.searchPages;if(!page.failed||page.loading||!currentSearchPages())return;
+      const failure=page.failedKind;page.failed=false;page.failedKind=null;
+      if(failure==='hybrid'){runHybridSearch(page.query,state.viewGeneration);return;}
+      if(failure==='first'){
+        state.instantCompleted=null;
+        page.loading=true;renderBrowseWindow();
+        requestFastSearch(page.query,state.viewGeneration).then(data=>{if(data!==null&&state.mode==='hybrid'&&state.status?.engine?.embedding_ready)runHybridSearch(page.query,state.viewGeneration);});
+        return;
+      }
+      if(failure==='restart'){
+        const epoch=page.epoch+1,phase=page.phase,query=page.query;state.searchPages={items:[],total:0,nextCursor:null,revision:null,loading:false,failed:false,failedKind:null,error:'',phase,epoch,query,warnings:[],intent:null};state.results=[];state.selected=null;state.selectionExplicit=false;state.searchPending=phase!=='hybrid'&&state.mode==='hybrid'&&Boolean(state.status?.engine?.embedding_ready);dom.resultsList.scrollTop=0;renderPreviewPlaceholder();loadSearchPage(true,state.viewGeneration,epoch,phase);return;
+      }
+      loadSearchPage(false,state.viewGeneration,page.epoch,page.phase);
+    });return button;
+  }
+  function renderSearchHint() {
+    const page=state.searchPages;
+    if(page.warnings.length)dom.searchHint.textContent=page.warnings.join(' · ');
+    else if(page.intent==='source_code')dom.searchHint.textContent='소스코드 파일과 검색어가 포함된 문서를 찾습니다.';
+    else updateSearchHint();
+  }
+  function updateSearchTitle() {
+    const page=state.searchPages,count=page.items.length,total=page.total;
+    const prefix=`“${state.query}”`;
+    const countText=`${total}개 · ${count}개 불러옴`;
+    dom.resultsTitle.textContent=page.loading?`${prefix} 검색 결과 ${countText} · 더 불러오는 중…`:page.failed&&count===0?`${prefix} 검색 결과를 불러오지 못했어요`:total?`${prefix}의 결과 ${countText}${state.searchPending?' · 의미 검색 중':''}`:state.searchPending?`${prefix} 결과 확인 중 · 의미 검색 중`:'찾은 파일이 없어요';
+  }
   function createResultCard(result) {
     const card=element('div','result-card'+(state.selected?.id===result.id?' selected':''));
+    card.resultRecord=result;card.resultView=state.view;
     card.setAttribute('role','option');card.setAttribute('tabindex',state.selected?.id===result.id?'0':'-1');card.setAttribute('aria-selected',String(state.selected?.id===result.id));card.setAttribute('aria-label',`${result.name}, ${result.path}`);card.setAttribute('data-result-id',String(result.id));
     const title=element('span','result-title',result.name);title.title=result.name;
     const path=element('span','result-path',result.path);path.title=result.path;
@@ -109,7 +141,7 @@
     return card;
   }
   function renderBrowseWindow() {
-    const list=state.browse.items,rowHeight=state.virtualRowHeight,scrollTop=Number(dom.resultsList.scrollTop)||0;
+    const page=currentResultPage(),list=page.items,rowHeight=state.virtualRowHeight,scrollTop=Number(dom.resultsList.scrollTop)||0;
     const viewportRows=Math.ceil((Number(dom.resultsList.clientHeight)||580)/rowHeight);
     const maxRows=100,visibleRows=Math.max(1,Math.min(maxRows,viewportRows+24));
     const start=Math.max(0,Math.min(list.length,Math.floor(scrollTop/rowHeight)-12));
@@ -121,14 +153,14 @@
     const oldBottom=Array.from(dom.resultsList.children).find(child=>child.className.includes('list-spacer-bottom'));
     const nodes=[];
     if(start>0){const spacer=oldTop||element('div','list-spacer list-spacer-top');spacer.style.height=`${start*rowHeight}px`;spacer.setAttribute('aria-hidden','true');nodes.push(spacer);}
-    for(let index=start;index<end;index++){const result=list[index];const card=oldCards.get(String(result.id))||createResultCard(result);const selected=String(result.id)===String(state.selected?.id);card.classList.toggle('selected',selected);card.setAttribute('aria-selected',String(selected));card.setAttribute('tabindex',selected?'0':'-1');card.setAttribute('aria-posinset',String(index+1));card.setAttribute('aria-setsize',String(state.browse.total||list.length));nodes.push(card);}
+    for(let index=start;index<end;index++){const result=list[index],previous=oldCards.get(String(result.id));const card=previous?.resultRecord===result&&previous.resultView===state.view?previous:createResultCard(result);const selected=String(result.id)===String(state.selected?.id);card.classList.toggle('selected',selected);card.setAttribute('aria-selected',String(selected));card.setAttribute('tabindex',selected?'0':'-1');card.setAttribute('aria-posinset',String(index+1));card.setAttribute('aria-setsize',String(page.total||list.length));nodes.push(card);}
     if(end<list.length){const spacer=oldBottom||element('div','list-spacer list-spacer-bottom');spacer.style.height=`${(list.length-end)*rowHeight}px`;spacer.setAttribute('aria-hidden','true');nodes.push(spacer);}
-    if(!list.length){const empty=element('div','results-empty',state.browse.loading?'파일 목록을 불러오는 중…':state.browse.failed?'파일 목록을 불러오지 못했어요':state.folder?'이 폴더와 하위 폴더에 파일이 없습니다':'검색 위치를 추가하면 파일 목록을 볼 수 있습니다.');if(state.browse.failed)empty.append(browseRetryButton());nodes.push(empty);}
-    else if(state.browse.failed){const retry=element('div','results-empty','다음 파일 페이지를 불러오지 못했어요.');retry.append(browseRetryButton());nodes.push(retry);}
+    if(!list.length){const failed=page.failed;const empty=element('div','results-empty',state.view==='search'?(page.loading?'파일을 찾는 중…':failed?'검색 결과를 불러오지 못했어요':'검색 결과가 없습니다.'):page.loading?'파일 목록을 불러오는 중…':failed?'파일 목록을 불러오지 못했어요':state.folder?'이 폴더와 하위 폴더에 파일이 없습니다':'검색 위치를 추가하면 파일 목록을 볼 수 있습니다.');if(failed)empty.append(state.view==='search'?searchRetryButton():browseRetryButton());nodes.push(empty);}
+    else if(page.failed){const retry=element('div','results-empty',state.view==='search'?'다음 검색 결과 페이지를 불러오지 못했어요.':'다음 파일 페이지를 불러오지 못했어요.');retry.append(state.view==='search'?searchRetryButton():browseRetryButton());nodes.push(retry);}
     dom.resultsList.replaceChildren(...nodes);
     dom.resultsList.scrollTop=scrollTop;
     if(activeResultId!==null){const focused=Array.from(dom.resultsList.querySelectorAll('.result-card')).find(card=>card.getAttribute('data-result-id')===activeResultId);focused?.focus({preventScroll:true});}
-    updateBrowseTitle();
+    if(state.view==='search'){updateSearchTitle();renderSearchHint();}else updateBrowseTitle();
   }
   function beginBrowseLoad() {
     if(state.closed)return;
@@ -174,10 +206,13 @@
     }
   }
   function onBrowseScroll() {
-    if(state.view!=='browse'||state.browse.loading||!state.browse.nextCursor)return;
+    const page=currentResultPage();
     const remaining=dom.resultsList.scrollHeight-dom.resultsList.scrollTop-dom.resultsList.clientHeight;
-    if(remaining<Math.max(300,state.virtualRowHeight*12))loadBrowsePage(false,state.viewGeneration);
-    else renderBrowseWindow();
+    if(!page.loading&&!page.failed&&page.nextCursor&&remaining<Math.max(300,state.virtualRowHeight*12)){
+      if(state.view==='search')loadSearchPage(false,state.viewGeneration,state.searchPages.epoch);else loadBrowsePage(false,state.viewGeneration);
+      return;
+    }
+    renderBrowseWindow();
   }
   async function resolveFolderScope() {
     if(state.closed)return;state.query=dom.query.value.trim();const requested=hashFolder(),sequence=++state.scopeSequence;state.searchSequence++;state.answerSequence++;state.searchPending=Boolean(state.query);state.results=[];state.selected=null;dom.answerRequest.disabled=true;dom.answerView.hidden=true;clearTimeout(state.searchTimer);
@@ -202,25 +237,45 @@
   async function cancelIndex(){try{await window.moa.invoke('cancel_index');await refreshStatus();toast('색인을 정리하고 있어요.');}catch(error){toast(error.message,true);}}
   async function downloadModel(kind){if(state.modelDownload?.running)return;if(kind==='chat'&&!state.status?.settings?.chat_enabled){dom.settingsFeedback.textContent='Gemma 4 답변을 켜고 설정을 저장한 뒤 다운로드할 수 있어요.';return;}state.modelDownloadKind=kind;state.reportedDownloadError='';const labels={embedding:'EmbeddingGemma 2 Q8_0',chat:'Gemma 4 E2B IT QAT Q4_0',ocr:'PP-OCRv5 OCR'};dom.settingsFeedback.textContent=`${labels[kind]} 다운로드를 요청했어요. 준비 중입니다…`;try{await window.moa.invoke('download_model',{kind});await refreshStatus();toast(`${labels[kind]} 다운로드를 시작했어요.`);}catch(error){state.modelDownloadKind='';dom.settingsFeedback.textContent=error.message;toast(error.message,true);}}
   function isCurrentSearch(query,generation) { return !state.closed&&state.view==='search'&&generation===state.viewGeneration&&dom.query.value.trim()===query&&state.query===query&&!state.folder?.pending&&!state.folder?.error; }
-  function applySearchResults(data,pending,phase='') {
-    state.searchPending=pending;state.results=data.results||[];const total=state.results.length;
-    dom.resultsTitle.textContent=phase?`“${state.query}”의 파일명·키워드 결과 ${total}개 · ${phase}`:total?`“${state.query}”의 결과 ${total}개`:'찾은 파일이 없어요';
-    renderResults(phase?{...data,warnings:[...(data.warnings||[]),'파일명·키워드 결과를 먼저 보여드리고 있어요. 의미 검색을 마치면 결과가 갱신됩니다.']}:data);
+  function applySearchPage(data,phase,generation,epoch,{replace=false,pending=false}={}) {
+    if(!currentSearchPages(generation,epoch))return false;
+    const previous=state.searchPages,oldSelected=state.selected,wasExplicit=state.selectionExplicit;
+    const nextEpoch=replace&&phase!==previous.phase?previous.epoch+1:previous.epoch;
+    const incoming=data.results||[];
+    let items;
+    if(replace)items=incoming.slice();
+    else{
+      items=previous.items.slice();const seen=new Set(items.map(item=>String(item.id)));
+      for(const result of incoming)if(!seen.has(String(result.id))){items.push(result);seen.add(String(result.id));}
+    }
+    const pendingWarning=pending?['파일명·키워드 결과를 먼저 보여드리고 있어요. 의미 검색을 마치면 결과가 갱신됩니다.']:[];
+    const warnings=replace?[...(data.warnings||[]),...pendingWarning]:[...new Set([...previous.warnings,...(data.warnings||[])])];
+    const reportedTotal=data.total===undefined?items.length:Number(data.total)||0;
+    state.searchPages={items,total:reportedTotal,nextCursor:data.next_cursor||null,revision:data.revision??previous.revision,loading:false,failed:false,failedKind:null,error:'',phase,epoch:nextEpoch,query:state.query,warnings,intent:data.intent??(replace?null:previous.intent)};
+    state.results=items;state.searchPending=pending;
+    const kept=wasExplicit&&oldSelected?items.find(item=>String(item.id)===String(oldSelected.id)):null;
+    state.selected=kept||items[0]||null;
+    if(!kept)state.selectionExplicit=false;
+    if(replace){dom.resultsList.scrollTop=0;dom.answerView.hidden=true;}
+    renderBrowseWindow();
+    if(state.selected&&(!kept||!oldSelected||String(oldSelected.id)!==String(state.selected.id)))selectResult(state.selected,$('.result-card',dom.resultsList),false);
+    else if(!state.selected)renderPreviewPlaceholder();
     dom.answerRequest.disabled=!answerAvailable();
+    return true;
   }
   function startFastTask(task) {
     state.instantInFlight=task;
-    task.promise=window.moa.invoke('search',{query:task.query,limit:30,extension:state.extension||null,folder:currentFolderPath(),mode:state.mode==='keyword'?'keyword':'instant'});
+    task.promise=window.moa.invoke('search_page',{query:task.query,limit:200,extension:state.extension||null,folder:currentFolderPath(),mode:task.phase,cursor:null});
     task.promise.then(data=>{
       task.data=data;
-      if(!isCurrentSearch(task.query,task.generation))return;
+      if(!currentSearchPages(task.generation,task.epoch))return;
       state.lastInstantData=data;
       const pending=state.mode==='hybrid'&&Boolean(state.status?.engine?.embedding_ready);
-      applySearchResults(data,pending,pending?'의미 검색 중':'');
+      applySearchPage(data,task.phase,task.generation,task.epoch,{replace:true,pending});
       if(state.mode==='hybrid'&&!pending)dom.searchHint.textContent='파일명·키워드 결과를 먼저 보여드립니다. 의미 검색은 EmbeddingGemma 2 Q8_0 준비 후 사용할 수 있어요.';
     }).catch(error=>{
-      if(!isCurrentSearch(task.query,task.generation))return;
-      state.searchPending=false;dom.answerRequest.disabled=true;dom.resultsTitle.textContent='검색하지 못했어요';dom.resultsList.replaceChildren(element('div','results-empty',error.message));toast(error.message,true);
+      if(!currentSearchPages(task.generation,task.epoch))return;
+      state.searchPending=false;state.searchPages.loading=false;state.searchPages.failed=true;state.searchPages.failedKind='first';state.searchPages.error=error.message;dom.answerRequest.disabled=true;renderBrowseWindow();toast(error.message,true);
     }).finally(()=>{
       if(state.instantInFlight===task)state.instantInFlight=null;
       if(task.generation===state.viewGeneration&&task.query===state.query)state.instantCompleted=task;
@@ -237,9 +292,44 @@
     const queued=state.instantQueued;
     if(queued?.query===query&&queued.generation===generation)return queued.done;
     let resolve;
-    const task={query,generation,done:new Promise(done=>{resolve=done;}),resolve:null};task.resolve=resolve;
+    const task={query,generation,phase:state.searchPages.phase,epoch:state.searchPages.epoch,done:new Promise(done=>{resolve=done;}),resolve:null};task.resolve=resolve;
     if(active){if(queued)queued.resolve();state.instantQueued=task;return task.done;}
     startFastTask(task);return task.done;
+  }
+  async function loadSearchPage(reset,generation=state.viewGeneration,epoch=state.searchPages.epoch,phase=state.searchPages.phase,resetCount=0) {
+    const page=state.searchPages;
+    if(!currentSearchPages(generation,epoch)||page.loading||(!reset&&(!page.nextCursor||page.failed)))return;
+    const cursor=reset?null:page.nextCursor;page.loading=true;page.failed=false;page.failedKind=null;renderBrowseWindow();
+    try{
+      const data=await window.moa.invoke('search_page',{query:page.query,limit:200,extension:state.extension||null,folder:currentFolderPath(),mode:phase,cursor});
+      if(!currentSearchPages(generation,epoch))return;
+      if(!reset&&(data.reset_required||(page.revision!==null&&data.revision!==page.revision))){
+        if(resetCount>=1){page.loading=false;page.failed=true;page.failedKind='first';page.error='검색 결과가 계속 변경되고 있어요.';renderBrowseWindow();return;}
+        const nextEpoch=page.epoch+1;state.searchPages={items:[],total:0,nextCursor:null,revision:null,loading:false,failed:false,failedKind:null,error:'',phase,epoch:nextEpoch,query:page.query,warnings:[],intent:null};state.results=[];state.selected=null;state.selectionExplicit=false;state.searchPending=true;dom.resultsList.scrollTop=0;renderPreviewPlaceholder();renderBrowseWindow();
+        await loadSearchPage(true,generation,nextEpoch,phase,resetCount+1);return;
+      }
+      if(reset){
+        if(data.reset_required){page.loading=false;page.failed=true;page.failedKind='first';page.error='검색 결과가 계속 변경되고 있어요.';renderBrowseWindow();return;}
+        const pending=phase!=='hybrid'&&state.mode==='hybrid'&&Boolean(state.status?.engine?.embedding_ready);
+        applySearchPage(data,phase,generation,epoch,{replace:true,pending});
+      }else{
+        const oldLength=page.items.length,seen=new Set(page.items.map(item=>String(item.id)));let added=0;
+        for(const result of data.results||[])if(!seen.has(String(result.id))){page.items.push(result);seen.add(String(result.id));added++;}
+        const nextCursor=data.next_cursor||null,stalled=nextCursor&&JSON.stringify(nextCursor)===JSON.stringify(cursor);
+        page.total=data.total===undefined?page.items.length:Number(data.total)||0;page.revision=data.revision??page.revision;page.nextCursor=stalled?null:nextCursor;page.failed=Boolean(stalled||(!added&&nextCursor));page.failedKind=page.failed?'restart':null;page.error=page.failed?'검색 결과 페이지가 진행되지 않아 처음부터 다시 불러와야 해요.':'';page.intent=data.intent??page.intent;page.warnings=[...new Set([...page.warnings,...(data.warnings||[])])];state.results=page.items;
+        if(!state.selected&&state.results.length){state.selected=state.results[0];state.selectionExplicit=false;}
+        renderBrowseWindow();
+        if(oldLength===0&&state.selected)selectResult(state.selected,$('.result-card',dom.resultsList),false);
+        dom.answerRequest.disabled=!answerAvailable();
+      }
+    }catch(error){
+      if(!currentSearchPages(generation,epoch))return;
+      page.loading=false;page.failed=true;page.failedKind=reset?'first':'append';page.error=error.message;
+      if(reset&&phase==='hybrid'&&page.phase!=='hybrid'){page.failedKind='hybrid';state.searchPending=false;}
+      renderBrowseWindow();dom.answerRequest.disabled=!answerAvailable();toast(error.message,true);
+    }finally{
+      if(currentSearchPages(generation,epoch)){page.loading=false;updateSearchTitle();}
+    }
   }
   function runHybridSearch(query,generation) {
     const active=state.hybridInFlight;
@@ -252,13 +342,20 @@
     const fastDone=await requestFastSearch(query,generation);
     if(!isCurrentSearch(query,generation)||fastDone===null)return;
     if(!state.status?.engine?.embedding_ready){state.searchPending=false;dom.answerRequest.disabled=!answerAvailable();return;}
+    state.searchPending=true;dom.answerRequest.disabled=true;updateSearchTitle();
     try{
-      const hybrid=await window.moa.invoke('search',{query,limit:30,extension:state.extension||null,folder:currentFolderPath(),mode:'hybrid'});
-      if(!isCurrentSearch(query,generation))return;
-      applySearchResults(hybrid,false);
+      for(let attempt=0;attempt<2;attempt++){
+        const epoch=state.searchPages.epoch;
+        const hybrid=await window.moa.invoke('search_page',{query,limit:200,extension:state.extension||null,folder:currentFolderPath(),mode:'hybrid',cursor:null});
+        if(!isCurrentSearch(query,generation))return;
+        if(epoch!==state.searchPages.epoch)continue;
+        applySearchPage(hybrid,'hybrid',generation,epoch,{replace:true,pending:false});
+        return;
+      }
+      state.searchPending=false;state.searchPages.failed=true;state.searchPages.failedKind='hybrid';state.searchPages.error='검색 결과가 계속 변경되고 있어요.';state.searchPages.warnings=[...state.searchPages.warnings,'검색 중 파일 목록이 변경되어 의미 검색을 다시 시도해 주세요.'];renderBrowseWindow();dom.answerRequest.disabled=!answerAvailable();
     }catch(error){
       if(!isCurrentSearch(query,generation))return;
-      applySearchResults({...state.lastInstantData,warnings:[...(state.lastInstantData?.warnings||[]),`의미 검색을 마치지 못했어요: ${error.message}`]},false);
+      state.searchPending=false;state.searchPages.failed=true;state.searchPages.failedKind='hybrid';state.searchPages.error=error.message;state.searchPages.warnings=[...state.searchPages.warnings,`의미 검색을 마치지 못했어요: ${error.message}`];renderBrowseWindow();dom.answerRequest.disabled=!answerAvailable();
     }
   }
   function startSearchView(query=dom.query.value.trim(),hybridDelay=200) {
@@ -266,18 +363,11 @@
     query=query.trim();if(!query){beginBrowseLoad();return;}if(state.folder?.pending||state.folder?.error){state.searchPending=false;dom.answerRequest.disabled=true;dom.resultsList.replaceChildren(element('div','results-empty','폴더 검색 범위를 확인할 수 없습니다.'));return;}
     clearTimeout(state.searchTimer);clearTimeout(state.hybridTimer);
     state.view='search';state.query=query;const generation=++state.viewGeneration;state.instantCompleted=null;state.searchSequence++;
+    const phase=state.mode==='keyword'?'keyword':'instant';state.searchPages={items:[],total:0,nextCursor:null,revision:null,loading:true,failed:false,failedKind:null,error:'',phase,epoch:state.searchPages.epoch+1,query,warnings:[],intent:null};state.results=[];
     state.answerSequence++;state.searchPending=true;state.selectionExplicit=false;state.results=[];state.selected=null;
     dom.answerRequest.disabled=true;dom.answerView.hidden=true;dom.welcome.hidden=true;dom.libraryIdle.hidden=true;dom.resultsView.hidden=false;dom.resultsTitle.textContent='파일 찾는 중…';dom.resultsList.replaceChildren(element('div','results-empty','파일명과 본문을 찾고 있어요…'));renderPreviewPlaceholder();updateSearchHint();
     requestFastSearch(query,generation);
     if(state.mode==='hybrid'&&state.status?.engine?.embedding_ready){if(hybridDelay<=0)runHybridSearch(query,generation);else state.hybridTimer=setTimeout(()=>runHybridSearch(query,generation),hybridDelay);}
-  }
-  function renderResults(data={}) {
-    dom.resultsList.replaceChildren();dom.answerView.hidden=true;
-    if(data.intent==='source_code')dom.searchHint.textContent='소스코드 파일과 검색어가 포함된 문서를 찾습니다.';else updateSearchHint();
-    if(data.warnings?.length)dom.resultsList.append(element('div','search-hint-inline',data.warnings.join(' · ')));
-    if(!state.results.length){const empty=element('div','results-empty',state.folder?'이 폴더와 하위 폴더에서 찾지 못했어요. 다른 검색어로 시도해 보세요.':'다른 단어로 다시 검색하거나 검색 위치를 추가해 보세요.');dom.resultsList.append(empty);state.selected=null;renderPreviewPlaceholder();return;}
-    for(const result of state.results)dom.resultsList.append(createResultCard(result));
-    if(!state.selectionExplicit||!state.selected||!state.results.some(r=>r.id===state.selected.id))selectResult(state.results[0],$('.result-card',dom.resultsList),false);
   }
   function clearForComposition() {
     clearTimeout(state.searchTimer);clearTimeout(state.hybridTimer);state.viewGeneration++;state.instantCompleted=null;state.searchSequence++;state.answerSequence++;state.view='search';state.query='';state.searchPending=true;state.results=[];state.selected=null;state.selectionExplicit=false;state.instantQueued?.resolve?.();state.instantQueued=null;
@@ -322,7 +412,8 @@
     else if(event.key==='Enter'&&state.selected){event.preventDefault();fileAction(state.selected.id,event.ctrlKey?'reveal':'open');return;}
     else return;
     event.preventDefault();
-    if(next>=state.results.length-1&&next===current&&event.key==='ArrowDown'&&state.view==='browse'&&state.browse.nextCursor){const generation=state.viewGeneration,selectedId=String(state.selected?.id??'');await loadBrowsePage(false,generation);if(generation!==state.viewGeneration||state.view!=='browse'||String(state.selected?.id??'')!==selectedId||dom.query.value.trim()!==state.query)return;next=Math.min(state.results.length-1,current+1);}
+    const page=currentResultPage();
+    if(next>=state.results.length-1&&next===current&&event.key==='ArrowDown'&&page.nextCursor){const view=state.view,generation=state.viewGeneration,epoch=state.searchPages.epoch,selectedId=String(state.selected?.id??'');if(view==='search')await loadSearchPage(false,generation,epoch,state.searchPages.phase);else await loadBrowsePage(false,generation);if(generation!==state.viewGeneration||state.view!==view||(view==='search'&&epoch!==state.searchPages.epoch)||String(state.selected?.id??'')!==selectedId||dom.query.value.trim()!==state.query)return;next=Math.min(state.results.length-1,current+1);}
     const result=state.results[next];if(!result)return;
     if(state.view==='browse'){
       const rowTop=next*state.virtualRowHeight,rowBottom=rowTop+state.virtualRowHeight,viewTop=dom.resultsList.scrollTop||0,viewBottom=viewTop+(dom.resultsList.clientHeight||580);
@@ -344,7 +435,7 @@
   updateSearchHint();document.querySelectorAll('.mode-button').forEach(button=>button.addEventListener('click',()=>{state.mode=button.dataset.mode;document.querySelectorAll('.mode-button').forEach(item=>{const active=item===button;item.classList.toggle('active',active);item.setAttribute('aria-pressed',String(active));});updateSearchHint();if(state.query)startSearchView(state.query,200);}));
   dom.extensionFilter.addEventListener('change',()=>{state.extension=dom.extensionFilter.value;if(state.query)startSearchView(state.query,200);else beginBrowseLoad();});dom.answerRequest.addEventListener('click',askAnswer);
   dom.query.addEventListener('keydown',event=>handleResultKey(event,true));
-  window.addEventListener('resize',()=>{if(state.view==='browse')renderBrowseWindow();});
+  window.addEventListener('resize',()=>{if(state.view==='browse'||state.view==='search')renderBrowseWindow();});
   dom.settingsForm.addEventListener('submit',async event=>{event.preventDefault();const form=new FormData(dom.settingsForm);const settings={embedding_model:String(form.get('embedding_model')||'').trim(),chat_model:String(form.get('chat_model')||'').trim(),chat_enabled:form.get('chat_enabled')==='true',gpu_mode:String(form.get('gpu_mode')||'auto'),n_gpu_layers:Number(form.get('n_gpu_layers')),context_size:Number(form.get('context_size')),scan_interval:Number(form.get('scan_interval')),max_file_mb:Number(form.get('max_file_mb')),filename_only_dirs:String(form.get('filename_only_dirs')||'')};const save=dom.settingsForm.querySelector('[type="submit"]');save.disabled=true;dom.settingsFeedback.textContent='저장하고 있어요…';try{await window.moa.invoke('update_settings',{settings});await refreshStatus();dom.settingsFeedback.textContent='설정을 저장했어요.';}catch(error){dom.settingsFeedback.textContent=error.message;}finally{save.disabled=Boolean(state.modelDownload?.running);}});
   dom.downloadEmbedding.addEventListener('click',()=>downloadModel('embedding'));dom.downloadChat.addEventListener('click',()=>downloadModel('chat'));dom.downloadOcr.addEventListener('click',()=>downloadModel('ocr'));
   document.addEventListener('keydown',event=>{if(dom.settingsDialog.open||dom.rootAddDialog.open)return;if(event.key==='F3'||(event.ctrlKey||event.metaKey)&&['f','k'].includes(event.key.toLowerCase())){event.preventDefault();dom.query.focus();dom.query.select();}});
