@@ -13,7 +13,7 @@
 ```powershell
 $licenses = .\packaging\collect-licenses.ps1 | ConvertFrom-Json
 .\packaging\release.ps1 `
-  -Version 0.5.1 `
+  -Version 0.5.2 `
   -SkipBuild `
   -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
   -CrtDirectory "$env:SystemRoot\System32" `
@@ -24,9 +24,9 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 `dist\artifacts\`에 다음 공개 파일이 생성됩니다.
 
-- `moasearch-0.5.0-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
-- `moasearch-0.5.0-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
-- `moasearch-0.5.0-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
+- `moasearch-0.5.2-win-x64-setup.exe`: Inno Setup 사용자별 설치 프로그램
+- `moasearch-0.5.2-win-x64.zip`: 동일한 앱 파일이 최상위에 있는 포터블 ZIP
+- `moasearch-0.5.2-win-x64-manifest.json`: 릴리스 자산과 패키지 내부 파일의 SHA-256, CRT 버전·서명, 최소 시스템 요구사항, 설치 위치, 모델 미포함 및 서명 상태
 - `SHA256SUMS.txt`: 설치기·ZIP·배포 명세·아이콘·커버·카탈로그 총 6개 파일의 SHA-256 (체크섬 파일 자신은 제외)
 - `icon.png`, `cover.png`: Moa Launcher 앱 아이콘과 커버
 - `moalauncher.json`: Moa Launcher 카탈로그 등록 메타데이터
@@ -41,13 +41,13 @@ Inno Setup이 `PATH`에 있으면 `-IsccPath`를 생략할 수 있습니다. 라
 
 설치기는 Windows 10/11 x64에서 `{localappdata}\Programs\moasearch` 아래에 현재 사용자 권한으로 설치합니다. 로컬 AI 기능은 AVX2를 지원하는 x64 CPU가 필요합니다. 관리자 권한을 요구하지 않습니다. `/SILENT /DIR="<경로>" /NORESTART` 옵션을 지원하며, 자동 설치에서는 앱을 시작하지 않습니다. 대화형 설치에서는 완료 화면의 실행 선택 항목을 제공합니다.
 
-직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 v0.5.0에서는 화면의 **앱 종료**를 먼저 누르세요. 구버전은 실행 창에서 `Ctrl+C`를 누르거나 창을 닫습니다. v0.5.0은 마지막 앱 창을 닫아도 종료됩니다. 구버전의 브라우저 화면만 닫은 경우에는 이전 프로세스를 별도로 종료하세요. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
+직접 설치할 때 Inno Setup은 Restart Manager로 실행 중인 파일을 확인합니다. 모아런처는 앱이 실행 중이면 업데이트를 시작하지 않으므로 업데이트 전에 모아검색 창을 모두 닫으세요. 마지막 창을 닫으면 확인창 없이 앱을 종료하며, 이미 실행 중인 추론이 있으면 완료를 기다릴 수 있습니다. 자동 설치·업데이트 후 앱을 다시 열지 않습니다. 데이터를 `%LOCALAPPDATA%\MoaSearch`에 저장하고, 설치 제거 시 데이터 폴더를 삭제하지 않습니다. 포터블 패키지도 동일한 데이터 위치를 사용합니다.
 
 **탐색기에서 현재 폴더 검색** 옵션은 현재 사용자 `HKCU\Software\Classes` 아래의 `Directory\shell\MoaSearch.SearchFolder`와 `Directory\Background\shell\MoaSearch.SearchBackground`를 등록합니다. 옵션 해제 업데이트와 설치 제거 시 이 두 앱 전용 키를 정리합니다. 폴더와 빈 공간의 명령은 각각 `%1`, `%V` 경로를 `open-folder --path`에 전달하며, 드라이브 루트의 끝 역슬래시가 인용부호와 충돌하지 않도록 `\.`을 붙입니다. Windows 11에서는 **추가 옵션 표시**에 나타날 수 있습니다. 등록 형식은 [Microsoft Shell 문서](https://learn.microsoft.com/windows/win32/shell/reg-shell-exts), 설치·제거 조건은 [Inno Setup Registry 문서](https://jrsoftware.org/ishelp/topic_registrysection.htm)를 따릅니다.
 
 ## Moa Launcher 카탈로그
 
-Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.5.0`을 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.5.0-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.5.0-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
+Moa Launcher의 카탈로그 항목에는 저장소 `hebory/moasearch`와 안정 버전 태그 `v0.5.2`를 등록하고, x64용 Inno 설치 패키지 하나를 연결하세요. 자산 이름은 `moasearch-0.5.2-win-x64-setup.exe`입니다. 포터블 ZIP `moasearch-0.5.2-win-x64.zip`도 직접 다운로드용 릴리스 자산으로 제공하지만 카탈로그 설치 선택지로 등록하지 않습니다. 패키징 스크립트는 카탈로그의 설치 자산 패턴이 생성될 실제 설치기 이름과 맞는지 확인합니다.
 
 Moa Launcher는 앱의 루트에서 공개 `icon.png`와 `cover.png`를 표시합니다. 이 이미지를 저장소 기본 브랜치에 게시하고 카탈로그의 앱 항목에서 해당 GitHub 이미지 주소를 참조하세요. `assets\branding\moasearch.ico`는 Windows 설치기의 아이콘이고, 모아 런처 상세 화면의 PNG 아이콘과 커버를 대체하지 않습니다.
 
