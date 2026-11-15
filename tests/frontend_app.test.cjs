@@ -450,6 +450,26 @@ test('ArrowDown on the last search result loads and selects the next cursor page
   assert.equal(selected.getAttribute('data-result-id'),'2');assert.equal(app.call('file').at(-1).args.id,2);
 });
 
+test('search Home, End, and page-boundary ArrowDown keep the selected virtual row visible', async () => {
+  const app=createApp();app.resolveStatus({roots:[{id:1,path:'C:\\docs'}],engine:{embedding_ready:false}});await flushAsyncWork();
+  app.modeButtons.find(button=>button.dataset.mode==='keyword').dispatch('click');
+  const query=app.elements.get('query');query.value='대량 검색';query.dispatch('input');
+  const cursor={snapshot_id:'keyboard-pages',offset:200,revision:1};
+  app.call('search_page')[0].resolve({results:Array.from({length:200},(_,index)=>listResult(index+1)),total:400,next_cursor:cursor,revision:1,mode:'keyword'});await flushAsyncWork();
+  const list=app.elements.get('results-list');
+  list.querySelectorAll('.result-card').find(row=>row.getAttribute('data-result-id')==='1').dispatch('keydown',{key:'End'});
+  let selected=list.querySelectorAll('.result-card').find(row=>row.getAttribute('aria-selected')==='true');
+  assert.equal(selected.getAttribute('data-result-id'),'200');assert.ok(list.scrollTop>0,'End scrolls the last loaded match into view');assert.equal(app.document.activeElement,selected);
+  selected.dispatch('keydown',{key:'ArrowDown'});
+  const next=app.call('search_page')[1];assert.deepEqual(next.args.cursor,cursor);
+  next.resolve({results:Array.from({length:200},(_,index)=>listResult(index+201)),total:400,next_cursor:null,revision:1,mode:'keyword'});await flushAsyncWork();
+  selected=list.querySelectorAll('.result-card').find(row=>row.getAttribute('aria-selected')==='true');
+  assert.equal(selected.getAttribute('data-result-id'),'201');assert.ok(list.scrollTop>0,'crossing a page boundary scrolls the new row into view');assert.equal(app.document.activeElement,selected);
+  selected.dispatch('keydown',{key:'Home'});
+  selected=list.querySelectorAll('.result-card').find(row=>row.getAttribute('aria-selected')==='true');
+  assert.equal(selected.getAttribute('data-result-id'),'1');assert.equal(list.scrollTop,0,'Home returns the virtual list to its first row');assert.equal(app.document.activeElement,selected);
+});
+
 test('hybrid replacement invalidates in-flight instant pages and preserves selected files only when present', async () => {
   const app = createApp();
   app.resolveStatus({ roots: [{ id: 1, path: 'C:\\docs' }], engine: { embedding_ready: true } });

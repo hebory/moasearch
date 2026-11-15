@@ -415,11 +415,9 @@
     const page=currentResultPage();
     if(next>=state.results.length-1&&next===current&&event.key==='ArrowDown'&&page.nextCursor){const view=state.view,generation=state.viewGeneration,epoch=state.searchPages.epoch,selectedId=String(state.selected?.id??'');if(view==='search')await loadSearchPage(false,generation,epoch,state.searchPages.phase);else await loadBrowsePage(false,generation);if(generation!==state.viewGeneration||state.view!==view||(view==='search'&&epoch!==state.searchPages.epoch)||String(state.selected?.id??'')!==selectedId||dom.query.value.trim()!==state.query)return;next=Math.min(state.results.length-1,current+1);}
     const result=state.results[next];if(!result)return;
-    if(state.view==='browse'){
-      const rowTop=next*state.virtualRowHeight,rowBottom=rowTop+state.virtualRowHeight,viewTop=dom.resultsList.scrollTop||0,viewBottom=viewTop+(dom.resultsList.clientHeight||580);
-      if(rowTop<viewTop)dom.resultsList.scrollTop=rowTop;else if(rowBottom>viewBottom)dom.resultsList.scrollTop=rowBottom-(dom.resultsList.clientHeight||580);
-      renderBrowseWindow();
-    }
+    const rowTop=next*state.virtualRowHeight,rowBottom=rowTop+state.virtualRowHeight,viewTop=dom.resultsList.scrollTop||0,viewBottom=viewTop+(dom.resultsList.clientHeight||580);
+    if(rowTop<viewTop)dom.resultsList.scrollTop=rowTop;else if(rowBottom>viewBottom)dom.resultsList.scrollTop=rowBottom-(dom.resultsList.clientHeight||580);
+    renderBrowseWindow();
     const card=Array.from(dom.resultsList.querySelectorAll('.result-card')).find(item=>item.getAttribute('data-result-id')===String(result.id));
     selectResult(result,card);card?.scrollIntoView({block:'nearest'});if(!fromQuery)card?.focus();
   }
