@@ -20,7 +20,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(".moasearch-rust-dev/models"));
     let store = Arc::new(Store::open(&data)?);
     store.update_settings(&json!({"embedding_model":config::canonical(&models_dir.join(models::EMBEDDING.filename))?,
-        "chat_model":config::canonical(&models_dir.join(models::CHAT.filename))?,"scan_interval":0}))?;
+        "chat_model":config::canonical(&models_dir.join(models::CHAT.filename))?,"chat_enabled":true,"scan_interval":0}))?;
     let fixtures =
         config::canonical(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/documents"))?;
     if !store

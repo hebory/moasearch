@@ -74,6 +74,9 @@ Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MoaSearch.Searc
 ; Extract to the installer temporary directory in PrepareToInstall, before app files are installed.
 Source: "{#PayloadDir}\MicrosoftEdgeWebview2Setup.exe"; Flags: dontcopy
 Source: "{#PayloadDir}\moasearch.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\cudart64_13.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\cublas64_13.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\MSVCP140.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -81,6 +84,7 @@ Source: "{#PayloadDir}\VCRUNTIME140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\VCRUNTIME140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\ONNX-Runtime-LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\ONNX-Runtime-ThirdPartyNotices.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\CUDA-Runtime-LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 

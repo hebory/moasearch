@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "moasearch"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "cfb",
@@ -2594,6 +2594,7 @@ dependencies = [
  "flate2",
  "image",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "lopdf",
  "oar-ocr",
  "ort",

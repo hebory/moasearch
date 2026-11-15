@@ -154,6 +154,10 @@ if (-not $SkipBuild) {
 
 $requiredDistFiles = @(
     'moasearch.exe',
+    'cudart64_13.dll',
+    'cublas64_13.dll',
+    'cublasLt64_13.dll',
+    'CUDA-Runtime-LICENSE',
     'onnxruntime.dll',
     'onnxruntime_providers_shared.dll',
     'ONNX-Runtime-LICENSE',
@@ -165,6 +169,22 @@ foreach ($name in $requiredDistFiles) {
     }
 }
 $appExe = Join-Path $distributionDirectory 'moasearch.exe'
+$cudaInventory = @(
+    foreach ($name in @('cudart64_13.dll','cublas64_13.dll','cublasLt64_13.dll')) {
+        $cudaFile = Join-Path $distributionDirectory $name
+        $cudaSignature = Get-AuthenticodeSignature -LiteralPath $cudaFile
+        if ($cudaSignature.Status -ne 'Valid' -or $cudaSignature.SignerCertificate.Subject -notmatch 'NVIDIA Corporation') {
+            throw "CUDA runtime의 NVIDIA 서명이 유효하지 않습니다: $name ($($cudaSignature.Status))"
+        }
+        [ordered]@{
+            file = $name
+            productVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($cudaFile).ProductVersion
+            sha256 = (Get-FileHash -LiteralPath $cudaFile -Algorithm SHA256).Hash.ToLowerInvariant()
+            signature = $cudaSignature.Status.ToString()
+            signer = $cudaSignature.SignerCertificate.Subject
+        }
+    }
+)
 $executableVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($appExe)
 if (-not $executableVersion.ProductVersion -or $executableVersion.ProductVersion.Split('+')[0] -ne $Version) {
     throw "앱 실행 파일 버전($($executableVersion.ProductVersion))과 패키지 버전($Version)이 다릅니다."
@@ -285,8 +305,8 @@ try {
         minimumSystem = [ordered]@{ operatingSystem = 'Windows 10/11 x64'; localAiCpu = 'AVX2 required' }
         packagedFiles = $payloadInventory
         licenses = @($licenseInventory)
-        runtime = [ordered]@{ source = $(if ($CrtDirectory -eq (Join-Path $env:SystemRoot 'System32')) { 'Windows System32' } else { 'Supplied Microsoft-signed CRT directory' }); msvcProductVersion = $crtVersion.ToString(); minimumMsvcProductVersion = '14.39.0.0'; files = @($crtInventory); webView2 = $webView2Inventory }
-        models = [ordered]@{ bundled = $false; googleEmbedding = 'EmbeddingGemma 2 Q8_0'; googleChat = 'Gemma 4 E2B QAT Q4_0'; ocr = 'PP-OCRv5 Korean ONNX'; downloadAfterInstall = $true }
+        runtime = [ordered]@{ source = $(if ($CrtDirectory -eq (Join-Path $env:SystemRoot 'System32')) { 'Windows System32' } else { 'Supplied Microsoft-signed CRT directory' }); msvcProductVersion = $crtVersion.ToString(); minimumMsvcProductVersion = '14.39.0.0'; files = @($crtInventory); webView2 = $webView2Inventory; cuda = [ordered]@{ source = 'NVIDIA CUDA Toolkit'; files = $cudaInventory; license = 'CUDA-Runtime-LICENSE'; cpuFallback = $true } }
+        models = [ordered]@{ bundled = $false; googleEmbedding = 'EmbeddingGemma 2 Q8_0'; googleChat = 'Gemma 4 E2B QAT Q4_0'; chatEnabledByDefault = $false; ocr = 'PP-OCRv5 Korean ONNX'; downloadAfterInstall = $true }
         branding = [ordered]@{ installerIcon = 'assets/branding/moasearch.ico'; installerIconSha256 = (Get-FileHash -LiteralPath $iconPath -Algorithm SHA256).Hash.ToLowerInvariant() }
         signature = [ordered]@{ codeSigned = $false; setupSigned = $false }
     }

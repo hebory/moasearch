@@ -1,4 +1,4 @@
-﻿param([switch]$Test, [switch]$PrepareOnly)
+﻿param([switch]$Test, [switch]$PrepareOnly, [switch]$CpuOnly, [string]$TestFilter)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -23,10 +23,35 @@ if (Test-Path -LiteralPath $vswhere) {
 }
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { throw 'CMake를 설치하고 PATH에 추가하세요.' }
 if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw 'Ninja를 설치하거나 Visual Studio CMake 도구를 추가하세요.' }
+# The packaged build includes CUDA plus llama.cpp's CPU fallback. A CPU-only
+# build remains available for development without the CUDA Toolkit installed.
+$gpuFeatureArgs = @()
+if (-not $CpuOnly) {
+    $cudaRoot = $env:CUDA_PATH
+    if (-not $cudaRoot -or -not (Test-Path -LiteralPath (Join-Path $cudaRoot 'bin\nvcc.exe'))) {
+        $cudaCandidates = @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit\CUDA') -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+        $cudaRoot = $cudaCandidates | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\nvcc.exe') } | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $cudaRoot) { throw '설치용 CUDA GPU 빌드에는 NVIDIA CUDA Toolkit과 nvcc가 필요합니다.' }
+    $env:CUDA_PATH = $cudaRoot
+    $cudaRuntimeDirectory = Join-Path $cudaRoot 'bin\x64'
+    $cudaRuntimeFiles = @('cudart64_13.dll','cublas64_13.dll','cublasLt64_13.dll')
+    foreach ($runtimeName in $cudaRuntimeFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $cudaRuntimeDirectory $runtimeName) -PathType Leaf)) {
+            throw "CUDA 재배포 runtime DLL이 없습니다: $runtimeName"
+        }
+    }
+    $cudaLicense = Join-Path $cudaRoot 'LICENSE'
+    if (-not (Test-Path -LiteralPath $cudaLicense -PathType Leaf)) { throw 'CUDA Toolkit LICENSE를 찾을 수 없습니다.' }
+    $gpuFeatureArgs = @('--features','gpu')
+    # Build native code for current Turing/Ampere GPUs plus forward-compatible
+    # PTX so newer NVIDIA devices can JIT the kernels at runtime.
+    $env:CMAKE_CUDA_ARCHITECTURES = '75-real;86-real;86-virtual'
+}
 # Avoid MSBuild structured compiler-output decoding errors on Korean Windows.
 $env:CMAKE_GENERATOR = 'Ninja'
 $env:VSLANG = '1033'
-if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) { $env:CMAKE_BUILD_PARALLEL_LEVEL = '4' }
+if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) { $env:CMAKE_BUILD_PARALLEL_LEVEL = '8' }
 if (-not $env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS = '4' }
 if (-not $env:LIBCLANG_PATH) {
     foreach ($candidate in @((Join-Path $PSScriptRoot '.moasearch-native\libclang\clang\native'), (Join-Path $env:ProgramFiles 'LLVM\bin'))) {
@@ -60,6 +85,11 @@ foreach ($profile in @('debug','release')) {
         Get-ChildItem -LiteralPath $env:ORT_LIB_PATH -Filter '*.dll' -File | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $runtimeDir -Force
         }
+        if (-not $CpuOnly) {
+            foreach ($runtimeName in $cudaRuntimeFiles) {
+                Copy-Item -LiteralPath (Join-Path $cudaRuntimeDirectory $runtimeName) -Destination $runtimeDir -Force
+            }
+        }
     }
 }
 if ($PrepareOnly) { return }
@@ -82,16 +112,21 @@ try {
     $env:CARGO_HOME = $savedCargoHome
     if ($fetchDrive) { & subst.exe "${fetchDrive}:" /D }
 }
-cargo build --release --locked
+$buildCommand = @('build','--release') + $gpuFeatureArgs + @('--locked')
+cargo @buildCommand
 if ($LASTEXITCODE -ne 0) { throw 'Rust 빌드에 실패했습니다.' }
-if ($Test) {
-    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+if ($Test -or $TestFilter) {
+    if (-not $TestFilter -and -not (Get-Command node -ErrorAction SilentlyContinue)) {
         throw '화면 IPC 검증에는 Node.js 18 이상이 필요합니다.'
     }
-    node --test tests/frontend_bridge.test.cjs tests/frontend_app.test.cjs
-    if ($LASTEXITCODE -ne 0) { throw '화면 IPC 검증에 실패했습니다.' }
+    if (-not $TestFilter) {
+        node --test tests/frontend_bridge.test.cjs tests/frontend_app.test.cjs
+        if ($LASTEXITCODE -ne 0) { throw '화면 IPC 검증에 실패했습니다.' }
+    }
     $env:PATH = "$(Join-Path $PSScriptRoot 'target\release');$env:PATH"
-    cargo test --release --locked
+    $testCommand = @('test','--release') + $gpuFeatureArgs + @('--locked')
+    if ($TestFilter) { $testCommand += @($TestFilter) }
+    cargo @testCommand
     if ($LASTEXITCODE -ne 0) { throw 'Rust 검증에 실패했습니다.' }
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot 'dist') | Out-Null
@@ -100,6 +135,21 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'target\release\moasearch.exe') 
 Get-ChildItem -LiteralPath (Join-Path $ortRoot 'lib') -Filter '*.dll' -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $PSScriptRoot 'dist') -Force
 }
+# CUDA 13 runtime DLLs are NVIDIA redistributables required by the linked
+# CUDA/cuBLAS backend; no CUDA Toolkit installation is needed by end users.
+if (-not $CpuOnly) {
+    foreach ($runtimeName in $cudaRuntimeFiles) {
+        Copy-Item -LiteralPath (Join-Path $cudaRuntimeDirectory $runtimeName) -Destination (Join-Path $PSScriptRoot 'dist') -Force
+    }
+    Copy-Item -LiteralPath $cudaLicense -Destination (Join-Path $PSScriptRoot 'dist\CUDA-Runtime-LICENSE') -Force
+} else {
+    foreach ($runtimeName in @('cudart64_13.dll','cublas64_13.dll','cublasLt64_13.dll','CUDA-Runtime-LICENSE')) {
+        $staleRuntime = Join-Path $PSScriptRoot "dist\$runtimeName"
+        if (Test-Path -LiteralPath $staleRuntime -PathType Leaf) { Remove-Item -LiteralPath $staleRuntime -Force }
+    }
+    Write-Host 'CPU-only 빌드: CUDA runtime DLL을 배포 폴더에 추가하지 않았습니다.'
+}
 Copy-Item -LiteralPath (Join-Path $ortRoot 'LICENSE') -Destination (Join-Path $PSScriptRoot 'dist\ONNX-Runtime-LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $ortRoot 'ThirdPartyNotices.txt') -Destination (Join-Path $PSScriptRoot 'dist\ONNX-Runtime-ThirdPartyNotices.txt') -Force
-Write-Host 'Rust 실행 파일 준비 완료: dist\moasearch.exe'
+if ($CpuOnly) { Write-Host 'CPU-only 실행 파일 준비 완료: dist\moasearch.exe' }
+else { Write-Host 'CUDA 가속 및 CPU fallback 실행 파일 준비 완료: dist\moasearch.exe' }
