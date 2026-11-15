@@ -7,7 +7,8 @@ use std::{
 };
 
 pub fn defaults() -> Value {
-    json!({"embedding_model":"", "chat_model":"", "n_gpu_layers":0,
+    json!({"embedding_model":"", "chat_model":"", "chat_enabled":false,
+        "gpu_mode":"auto", "n_gpu_layers":0,
         "context_size":4096, "scan_interval":300, "max_file_mb":32,
         "filename_only_dirs":"_site,temp,vendor"})
 }

@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tao::{
@@ -44,6 +44,7 @@ struct AppWindow {
     webview: WebView,
     window: Window,
     folder: Option<PathBuf>,
+    search_generation: Arc<AtomicU64>,
 }
 
 pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBuf>) -> Result<()> {
@@ -69,6 +70,9 @@ pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBu
     let instance = Instance::bind(&store.data_dir, handler)?;
     let services = AppServices::new(store.clone(), engine);
     let workers = worker::Workers::new(4, 64);
+    // Reserve workers for instant results/status even when model requests wait
+    // for a running inference. Both pools remain inside this desktop process.
+    let model_workers = worker::Workers::new(2, 16);
     let mut context = WebContext::new(Some(store.data_dir.join("webview2")));
     let first = create_window(&event_loop, &mut context, folder, proxy.clone())?;
     let mut windows = HashMap::from([(first.window.id(), first)]);
@@ -136,12 +140,26 @@ pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBu
                     return;
                 }
                 let boot = matches!(command, Command::Status {});
+                let uses_model = matches!(&command, Command::Answer(_))
+                    || matches!(&command, Command::Search(input) if input.mode == "hybrid");
+                let generation = matches!(&command, Command::Search(_)).then(|| {
+                    let counter = window.search_generation.clone();
+                    let expected = counter.fetch_add(1, Ordering::AcqRel) + 1;
+                    (counter, expected)
+                });
                 let request = Arc::new(request);
                 let background_request = request.clone();
                 let services = services.clone();
                 let responder = proxy.clone();
-                let submitted = workers.submit(move || {
+                let pool = if uses_model { &model_workers } else { &workers };
+                let submitted = pool.submit(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if let Some((counter, expected)) = generation {
+                            ensure!(
+                                counter.load(Ordering::Acquire) == expected,
+                                "새 검색으로 대체된 요청입니다."
+                            );
+                        }
                         services.execute(command)
                     }))
                     .unwrap_or_else(|_| Err(anyhow!("앱 작업 처리 중 오류가 발생했습니다.")));
@@ -173,6 +191,7 @@ pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBu
     closing.store(true, Ordering::Release);
     windows.clear();
     services.begin_shutdown();
+    drop(model_workers);
     drop(workers);
     services.wait_shutdown()?;
     drop(instance);
@@ -251,5 +270,6 @@ fn create_window(
         webview,
         window,
         folder,
+        search_generation: Arc::new(AtomicU64::new(0)),
     })
 }

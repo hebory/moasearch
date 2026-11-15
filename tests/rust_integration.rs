@@ -65,6 +65,28 @@ impl Embedder for FailOnceEngine {
 struct NamedEngine {
     id: String,
     calls: AtomicUsize,
+    encoded_texts: AtomicUsize,
+}
+
+struct StaleGenerationEngine {
+    store: Arc<Store>,
+    mutated: AtomicBool,
+}
+
+impl Embedder for StaleGenerationEngine {
+    fn model_id(&self) -> Option<String> {
+        Some("fixture-google".into())
+    }
+    fn embed(&self, texts: &[String], _: bool) -> Result<Vec<Vec<f32>>> {
+        if !self.mutated.swap(true, Ordering::SeqCst) {
+            let db = self.store.connect()?;
+            db.execute("UPDATE file_generations SET generation=generation+1", [])?;
+        }
+        Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+    }
+    fn answer(&self, _: &str, _: &str) -> Result<String> {
+        Ok("예제 답변 [1]".into())
+    }
 }
 
 impl Embedder for NamedEngine {
@@ -73,6 +95,7 @@ impl Embedder for NamedEngine {
     }
     fn embed(&self, texts: &[String], _: bool) -> Result<Vec<Vec<f32>>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.encoded_texts.fetch_add(texts.len(), Ordering::SeqCst);
         Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
     }
     fn answer(&self, _: &str, _: &str) -> Result<String> {
@@ -113,11 +136,13 @@ fn incremental_index_keeps_text_and_reuses_vectors() -> Result<()> {
     assert_eq!(first["indexed"], 96);
     assert_eq!(store.counts()?["vectors"], 96);
     let calls = engine.calls.load(Ordering::SeqCst);
+    let stable_revision = store.index_state()?["revision"].as_i64().unwrap();
     index.start();
     let second = wait(&index);
     assert_eq!(second["skipped"], 96);
     assert_eq!(second["phase"], "complete");
     assert_eq!(engine.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(store.index_state()?["revision"], stable_revision);
     std::fs::write(
         docs.join("계약_0.txt"),
         "수정 계약번호 0 보증금은 30일 이내 반환합니다.",
@@ -237,6 +262,129 @@ fn index_status_reports_embedding_chunk_progress_and_clears_it_on_completion() -
 }
 
 #[test]
+fn filenames_and_extracted_text_are_searchable_before_embedding_finishes() -> Result<()> {
+    struct PausedEngine {
+        started: AtomicBool,
+        released: Arc<AtomicBool>,
+    }
+    impl Embedder for PausedEngine {
+        fn model_id(&self) -> Option<String> {
+            Some("fixture-google".into())
+        }
+        fn embed(&self, texts: &[String], _: bool) -> Result<Vec<Vec<f32>>> {
+            self.started.store(true, Ordering::Release);
+            while !self.released.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+        fn answer(&self, _: &str, _: &str) -> Result<String> {
+            unreachable!()
+        }
+    }
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let dir = scratch()?;
+    let docs = dir.path().join("documents");
+    std::fs::create_dir(&docs)?;
+    std::fs::write(
+        docs.join("급여명세서_2026.txt"),
+        "이번 달 급여명세서 총액은 350만원입니다.",
+    )?;
+    std::fs::write(
+        docs.join("회의기록_2026.txt"),
+        "프로젝트 회의기록에서 출시 일정을 확인합니다.",
+    )?;
+
+    let store = Arc::new(Store::open(dir.path().join("data"))?);
+    store.add_root(&docs)?;
+    let released = Arc::new(AtomicBool::new(false));
+    let _release = ReleaseOnDrop(released.clone());
+    let engine = Arc::new(PausedEngine {
+        started: AtomicBool::new(false),
+        released: released.clone(),
+    });
+    let index = Indexer::new(store.clone(), engine.clone());
+    assert!(index.start());
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = index.status();
+        if engine.started.load(Ordering::Acquire) {
+            assert_eq!(status["running"], true);
+            assert_eq!(status["metadata_done"], 2);
+            assert_eq!(status["metadata_total"], 2);
+            assert_eq!(status["content_done"], 2);
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "embedding phase was not reached: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let search = Search::new(
+        store,
+        Arc::new(MockEngine {
+            calls: AtomicUsize::new(0),
+            delay: false,
+        }),
+    );
+    let filename = search.search("급여명세서", 10, None, "keyword")?;
+    assert!(
+        filename["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| { file["name"] == "급여명세서_2026.txt" })
+    );
+    let body = search.search("350만원", 10, None, "keyword")?;
+    assert!(
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| { file["name"] == "급여명세서_2026.txt" })
+    );
+
+    released.store(true, Ordering::Release);
+    let finished = wait(&index);
+    assert_eq!(finished["phase"], "complete");
+    Ok(())
+}
+
+#[test]
+fn generation_conflict_leaves_index_partial_instead_of_reporting_complete() -> Result<()> {
+    let dir = scratch()?;
+    let docs = dir.path().join("documents");
+    std::fs::create_dir(&docs)?;
+    std::fs::write(docs.join("generation.txt"), "generation conflict body")?;
+
+    let store = Arc::new(Store::open(dir.path().join("data"))?);
+    store.add_root(&docs)?;
+    let index = Indexer::new(
+        store.clone(),
+        Arc::new(StaleGenerationEngine {
+            store: store.clone(),
+            mutated: AtomicBool::new(false),
+        }),
+    );
+    assert!(index.start());
+    let status = wait(&index);
+    assert_eq!(status["errors"], 0);
+    assert_eq!(status["embedding_state"], "pending");
+    assert_eq!(status["phase"], "partial");
+    assert_eq!(status["embedding_done_chunks"], 0);
+    assert!(status["embedding_total_chunks"].as_u64().unwrap() > 0);
+    Ok(())
+}
+
+#[test]
 fn identical_files_reuse_vectors_within_a_run_and_after_indexer_restart() -> Result<()> {
     let dir = scratch()?;
     let docs = dir.path().join("documents");
@@ -250,6 +398,7 @@ fn identical_files_reuse_vectors_within_a_run_and_after_indexer_restart() -> Res
     let engine = Arc::new(NamedEngine {
         id: "fixture-google".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
     let first_indexer = Indexer::new(store.clone(), engine.clone());
     assert!(first_indexer.start());
@@ -286,6 +435,7 @@ fn invalid_cached_vector_is_reembedded_instead_of_skipped() -> Result<()> {
     let engine = Arc::new(NamedEngine {
         id: "fixture-google".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
     let first_indexer = Indexer::new(store.clone(), engine.clone());
     assert!(first_indexer.start());
@@ -307,7 +457,7 @@ fn invalid_cached_vector_is_reembedded_instead_of_skipped() -> Result<()> {
     assert!(recovery_indexer.start());
     let recovered = wait(&recovery_indexer);
     assert_eq!(recovered["phase"], "complete");
-    assert_eq!(recovered["indexed"], 1);
+    assert_eq!(recovered["indexed"], 0);
     assert_eq!(recovered["reused"], 0);
     assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
     assert_eq!(store.counts()?["vectors"], 1);
@@ -357,6 +507,7 @@ fn legacy_content_is_backfilled_then_reused_from_store() -> Result<()> {
     let engine = Arc::new(NamedEngine {
         id: "fixture-google".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
 
     let backfill_indexer = Indexer::new(store.clone(), engine.clone());
@@ -364,7 +515,9 @@ fn legacy_content_is_backfilled_then_reused_from_store() -> Result<()> {
     let backfilled = wait(&backfill_indexer);
     assert_eq!(backfilled["phase"], "complete");
     assert_eq!(backfilled["skipped"], 1);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 0);
+    // This legacy row has vectors but no cache key carrying its context size;
+    // re-embed it once before reusing its now-verified cache for copies.
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
 
     std::fs::write(docs.join("legacy-copy.txt"), text)?;
     let restarted_indexer = Indexer::new(store.clone(), engine.clone());
@@ -373,7 +526,7 @@ fn legacy_content_is_backfilled_then_reused_from_store() -> Result<()> {
     assert_eq!(reused["phase"], "complete");
     assert_eq!(reused["indexed"], 1);
     assert_eq!(reused["reused"], 1);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.counts()?["vectors"], 2);
     Ok(())
 }
@@ -391,6 +544,7 @@ fn identical_passages_in_different_files_reuse_only_the_shared_chunk_vector() ->
     let engine = Arc::new(NamedEngine {
         id: "fixture-google".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
     let indexer = Indexer::new(store.clone(), engine.clone());
 
@@ -398,7 +552,8 @@ fn identical_passages_in_different_files_reuse_only_the_shared_chunk_vector() ->
     let status = wait(&indexer);
     assert_eq!(status["phase"], "complete");
     assert_eq!(status["reused_chunks"], 1);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.encoded_texts.load(Ordering::SeqCst), 3);
     assert_eq!(store.counts()?["files"], 2);
     assert_eq!(store.counts()?["vectors"], 4);
     Ok(())
@@ -417,6 +572,7 @@ fn file_content_cache_identity_invalidates_for_changed_content_extension_context
     let first_engine = Arc::new(NamedEngine {
         id: "fixture-google-v1".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
     let first_indexer = Indexer::new(store.clone(), first_engine.clone());
     assert!(first_indexer.start());
@@ -445,7 +601,7 @@ fn file_content_cache_identity_invalidates_for_changed_content_extension_context
     let context_indexer = Indexer::new(store.clone(), first_engine.clone());
     assert!(context_indexer.start());
     let context_status = wait(&context_indexer);
-    assert_eq!(context_status["indexed"], 2);
+    assert_eq!(context_status["indexed"], 0);
     assert_eq!(context_status["reused"], 0);
     assert_eq!(context_status["reused_chunks"], 1);
     assert_eq!(first_engine.calls.load(Ordering::SeqCst), 3);
@@ -453,11 +609,12 @@ fn file_content_cache_identity_invalidates_for_changed_content_extension_context
     let second_engine = Arc::new(NamedEngine {
         id: "fixture-google-v2".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
     let model_indexer = Indexer::new(store, second_engine.clone());
     assert!(model_indexer.start());
     let model_status = wait(&model_indexer);
-    assert_eq!(model_status["indexed"], 2);
+    assert_eq!(model_status["indexed"], 0);
     assert_eq!(model_status["reused"], 0);
     assert_eq!(model_status["reused_chunks"], 1);
     assert_eq!(second_engine.calls.load(Ordering::SeqCst), 1);
@@ -505,6 +662,7 @@ fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_clea
     let engine = Arc::new(NamedEngine {
         id: "fixture-google".into(),
         calls: AtomicUsize::new(0),
+        encoded_texts: AtomicUsize::new(0),
     });
 
     let initial_indexer = Indexer::new(store.clone(), engine.clone());
@@ -513,7 +671,8 @@ fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_clea
     assert_eq!(initial["phase"], "complete");
     assert_eq!(store.counts()?["files"], 8);
     assert_eq!(store.counts()?["chunks"], 8);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.encoded_texts.load(Ordering::SeqCst), 5);
 
     store.update_settings(&json!({"filename_only_dirs":"_site, temp, VENDOR"}))?;
     let policy_indexer = Indexer::new(store.clone(), engine.clone());
@@ -525,7 +684,7 @@ fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_clea
     assert_eq!(store.counts()?["files"], 8);
     assert_eq!(store.counts()?["chunks"], 2);
     assert_eq!(store.counts()?["vectors"], 2);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
 
     let db = store.connect()?;
     let metadata_rows: i64 = db.query_row(
@@ -549,7 +708,7 @@ fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_clea
     assert_eq!(stable["indexed"], 0);
     assert_eq!(stable["skipped"], 8);
     assert_eq!(store.counts()?["chunks"], 2);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
 
     let search = Search::new(store.clone(), engine.clone());
     for body_token in [
@@ -589,7 +748,8 @@ fn generated_directories_keep_names_hide_content_and_restore_when_policy_is_clea
     assert_eq!(restored["phase"], "complete");
     assert_eq!(restored["indexed"], 6);
     assert_eq!(restored["reused"], 3);
-    assert_eq!(engine.calls.load(Ordering::SeqCst), 8);
+    assert_eq!(engine.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(engine.encoded_texts.load(Ordering::SeqCst), 8);
     assert_eq!(store.counts()?["files"], 8);
     assert_eq!(store.counts()?["chunks"], 8);
     assert_eq!(store.counts()?["vectors"], 8);
@@ -639,8 +799,32 @@ fn cancellation_preserves_prior_records_and_publishes_completed_files() -> Resul
     second.cancel();
     let status = wait(&second);
     assert_eq!(status["phase"], "cancelled");
-    assert_eq!(status["indexed"], 1);
-    assert_eq!(store.counts()?["files"], 8);
+    assert_eq!(status["indexed"], 7);
+    assert_eq!(status["metadata_total"], 7);
+    assert_eq!(status["metadata_done"], 7);
+    assert_eq!(status["content_done"], 7);
+    assert_eq!(store.counts()?["files"], 7);
+    assert_eq!(store.counts()?["chunks"], 7);
+    let search = Search::new(
+        store.clone(),
+        Arc::new(MockEngine {
+            calls: AtomicUsize::new(0),
+            delay: false,
+        }),
+    );
+    assert_eq!(
+        search.search("서로 다른 프로젝트", 10, None, "keyword")?["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
+    assert!(
+        search.search("기존", 10, None, "keyword")?["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -739,13 +923,24 @@ fn app_services_execute_typed_commands_and_shutdown_cleanly() -> Result<()> {
     }))?;
     assert_eq!(search["results"].as_array().unwrap().len(), 1);
     assert_eq!(search["results"][0]["name"], "계약.txt");
-    let answer = services.execute(Command::Answer(SearchInput {
+    let question = SearchInput {
         query: "계약검토".into(),
         limit: 30,
         extension: None,
         mode: "keyword".into(),
         folder: Some(documents.join("선택")),
-    }))?;
+    };
+    assert_eq!(store.settings()?["chat_enabled"], false);
+    assert!(services.execute(Command::Answer(question.clone())).is_err());
+    assert!(
+        services
+            .execute(Command::DownloadModel {
+                kind: "chat".into()
+            })
+            .is_err()
+    );
+    store.update_settings(&json!({"chat_enabled":true}))?;
+    let answer = services.execute(Command::Answer(question))?;
     assert_eq!(answer["sources"].as_array().unwrap().len(), 1);
     assert!(
         services

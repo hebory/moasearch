@@ -38,7 +38,7 @@ impl SearchInput {
             "검색 결과 수는 1~100개여야 합니다."
         );
         anyhow::ensure!(
-            ["hybrid", "keyword"].contains(&self.mode.as_str()),
+            ["hybrid", "keyword", "instant"].contains(&self.mode.as_str()),
             "알 수 없는 검색 방식입니다."
         );
         anyhow::ensure!(

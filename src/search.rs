@@ -363,7 +363,10 @@ impl Search {
         let limit = limit.clamp(1, 100);
         let folder = folder.map(canonical_folder).transpose()?;
         let folder = folder.as_deref();
-        let source_code_intent = mode == "hybrid" && intent::is_source_code_query(query);
+        // The first, non-model response must use exactly the same lexical
+        // interpretation as the later semantic response.
+        let natural_language = matches!(mode, "hybrid" | "instant");
+        let source_code_intent = natural_language && intent::is_source_code_query(query);
         let terms = terms(query);
         // In a sentence, a single Hangul character such as "뒤" must not make an
         // otherwise unrelated passage a keyword hit. Literal keyword mode and
@@ -379,7 +382,7 @@ impl Search {
             .into_iter()
             .map(str::to_string)
             .collect()
-        } else if mode == "hybrid"
+        } else if natural_language
             && terms.len() > 1
             && terms.iter().any(|term| term.chars().count() > 1)
         {
@@ -435,34 +438,43 @@ impl Search {
         let mut actual_mode = "keyword";
         if mode == "hybrid" && !source_code_intent {
             if let Some(model_id) = self.engine.model_id() {
-                match self.query_vector(&model_id, query) {
-                    Ok(query_vector) => {
-                        match self.semantic_search(
-                            &model_id,
-                            &query_vector,
-                            extension.as_deref(),
-                            folder,
-                            limit,
-                            &mut hits,
-                            &mut next_hit_order,
-                        ) {
-                            Ok((has_candidates, _)) => {
-                                actual_mode = "hybrid";
-                                if !has_candidates {
-                                    warnings.push(
+                let has_vectors: bool = self.store.connect()?.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chunks WHERE model_id=?1 AND vector IS NOT NULL)",
+                    [&model_id],
+                    |row| row.get(0),
+                )?;
+                if !has_vectors {
+                    warnings.push("EmbeddingGemma2 의미 색인을 백그라운드에서 준비하고 있습니다. 준비된 이름·본문 검색 결과를 표시합니다.".to_string());
+                } else {
+                    match self.query_vector(&model_id, query) {
+                        Ok(query_vector) => {
+                            match self.semantic_search(
+                                &model_id,
+                                &query_vector,
+                                extension.as_deref(),
+                                folder,
+                                limit,
+                                &mut hits,
+                                &mut next_hit_order,
+                            ) {
+                                Ok((has_candidates, _)) => {
+                                    actual_mode = "hybrid";
+                                    if !has_candidates {
+                                        warnings.push(
                                         "현재 모델의 의미 색인이 없습니다. 폴더를 다시 색인하세요."
                                             .to_string(),
                                     );
+                                    }
                                 }
+                                Err(error) => warnings.push(format!(
+                                    "의미 검색을 사용할 수 없어 키워드로 검색했습니다: {error}"
+                                )),
                             }
-                            Err(error) => warnings.push(format!(
-                                "의미 검색을 사용할 수 없어 키워드로 검색했습니다: {error}"
-                            )),
                         }
+                        Err(error) => warnings.push(format!(
+                            "의미 검색을 사용할 수 없어 키워드로 검색했습니다: {error}"
+                        )),
                     }
-                    Err(error) => warnings.push(format!(
-                        "의미 검색을 사용할 수 없어 키워드로 검색했습니다: {error}"
-                    )),
                 }
             } else {
                 warnings.push(
@@ -533,8 +545,7 @@ impl Search {
     }
 
     fn query_vector(&self, model_id: &str, query: &str) -> Result<Vec<f32>> {
-        let mut cache = self.query_vectors.lock().unwrap();
-        if let Some(vector) = cache.get(model_id, query) {
+        if let Some(vector) = self.query_vectors.lock().unwrap().get(model_id, query) {
             return Ok(vector);
         }
         let mut vectors = self.engine.embed(&[query.to_string()], true)?;
@@ -546,7 +557,11 @@ impl Search {
             return Err(anyhow!("검색 임베딩이 비어 있거나 올바르지 않습니다."));
         }
         normalize(&mut vector);
-        cache.insert(model_id.to_string(), query.to_string(), vector.clone());
+        self.query_vectors.lock().unwrap().insert(
+            model_id.to_string(),
+            query.to_string(),
+            vector.clone(),
+        );
         Ok(vector)
     }
 
@@ -1314,6 +1329,14 @@ mod tests {
         let search = Search::new(store, Arc::new(FixtureEngine::new("google-a")));
         assert!(
             search
+                .search("이사 나간 뒤 맡긴 돈", 10, None, "instant")
+                .unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search
                 .search("이사 나간 뒤 맡긴 돈", 10, None, "hybrid")
                 .unwrap()["results"]
                 .as_array()
@@ -1384,6 +1407,8 @@ mod tests {
                 && names.contains(&"소스코드_목록.txt")
         );
         assert_eq!(result["intent"], "source_code");
+        let instant = search.search("소스코드", 10, None, "instant").unwrap();
+        assert_eq!(instant["results"], result["results"]);
         for alias in ["소스 코드", "source code", "SOURCE-CODE"] {
             let aliased = search.search(alias, 10, None, "hybrid").unwrap();
             assert_eq!(aliased["results"].as_array().unwrap().len(), 4);
@@ -1408,6 +1433,59 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn a_cached_query_does_not_wait_for_an_unrelated_model_request() {
+        use std::sync::mpsc;
+        struct BlockingEngine {
+            started: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Embedder for BlockingEngine {
+            fn model_id(&self) -> Option<String> {
+                Some("google-a".into())
+            }
+            fn embed(&self, _: &[String], _: bool) -> Result<Vec<Vec<f32>>> {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(vec![vec![1.0, 0.0]])
+            }
+            fn answer(&self, _: &str, _: &str) -> Result<String> {
+                unreachable!()
+            }
+        }
+        let (_temp, store, _, _) = fixture();
+        let (started, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let search = Arc::new(Search::new(
+            store,
+            Arc::new(BlockingEngine {
+                started,
+                release: Mutex::new(wait),
+            }),
+        ));
+        search.query_vectors.lock().unwrap().insert(
+            "google-a".into(),
+            "cached".into(),
+            vec![0.0, 1.0],
+        );
+        let slow_search = search.clone();
+        let slow = std::thread::spawn(move || slow_search.query_vector("google-a", "slow"));
+        ready
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (done, result) = mpsc::channel();
+        let fast_search = search.clone();
+        let fast = std::thread::spawn(move || {
+            done.send(fast_search.query_vector("google-a", "cached"))
+                .unwrap()
+        });
+        let cached = result.recv_timeout(std::time::Duration::from_secs(2));
+        release.send(()).unwrap();
+        slow.join().unwrap().unwrap();
+        fast.join().unwrap();
+        assert_eq!(cached.unwrap().unwrap(), vec![0.0, 1.0]);
     }
 
     #[test]
@@ -1646,6 +1724,20 @@ mod tests {
         assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 1);
 
         *engine.model.lock().unwrap() = "google-b".into();
+        let preparing = search
+            .search("same natural language query", 10, None, "hybrid")
+            .unwrap();
+        assert_eq!(preparing["mode"], "keyword");
+        assert!(!preparing["warnings"].as_array().unwrap().is_empty());
+        assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 1);
+        add_document(
+            &store,
+            &library,
+            root_id,
+            "new-model.txt",
+            vec![vec![0.9, 0.1]],
+            "google-b",
+        );
         search
             .search("same natural language query", 10, None, "hybrid")
             .unwrap();

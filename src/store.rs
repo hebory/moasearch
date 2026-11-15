@@ -29,6 +29,45 @@ pub struct FileRecord {
     pub content_key: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct InventoryRecord {
+    pub root_id: i64,
+    pub path: PathBuf,
+    pub size: i64,
+    pub modified: i64,
+    pub reader_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedFile {
+    pub id: i64,
+    pub root_id: i64,
+    pub path: PathBuf,
+    pub size: i64,
+    pub modified: i64,
+    pub status: String,
+    pub model_id: Option<String>,
+    pub reader_id: String,
+    pub generation: i64,
+    pub embedding_context: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EmbeddingChunk {
+    pub id: i64,
+    pub file_id: i64,
+    pub generation: i64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EmbeddingUpdate {
+    pub id: i64,
+    pub file_id: i64,
+    pub generation: i64,
+    pub vector: Vec<f32>,
+}
+
 pub(crate) struct ReusedContent {
     pub passages: Vec<Passage>,
     pub vectors: Option<Vec<Vec<f32>>>,
@@ -78,6 +117,17 @@ impl Store {
                  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
                  content_key TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS file_content_keys_key ON file_content_keys(content_key);
+             CREATE TABLE IF NOT EXISTS file_generations (
+                 file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                 generation INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS file_embedding_context (
+                 file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                 generation INTEGER NOT NULL,
+                 model_id TEXT NOT NULL,
+                 context_size INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS chunk_embedding_context (
+                 chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                 context_size INTEGER NOT NULL);
              CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                  text, content='chunks', content_rowid='id', tokenize='trigram');
              CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
@@ -97,8 +147,117 @@ impl Store {
                 "ALTER TABLE files ADD COLUMN reader_id TEXT NOT NULL DEFAULT 'legacy-v1'",
             )?;
         }
+        db.execute(
+            "INSERT OR IGNORE INTO file_generations(file_id,generation)
+             SELECT id,0 FROM files",
+            [],
+        )?;
+        Self::backfill_embedding_contexts(&mut db)?;
         Self::prepare_search_metadata(&mut db)?;
         Ok(store)
+    }
+
+    fn backfill_embedding_contexts(db: &mut Connection) -> Result<()> {
+        let legacy = {
+            let mut stmt = db.prepare(
+                "SELECT f.id,COALESCE(g.generation,0),f.model_id,k.content_key
+                 FROM files f JOIN file_content_keys k ON k.file_id=f.id
+                 LEFT JOIN file_generations g ON g.file_id=f.id
+                 LEFT JOIN file_embedding_context e ON e.file_id=f.id
+                 WHERE f.status='content' AND f.model_id IS NOT NULL AND e.file_id IS NULL",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let mut migrated = Vec::new();
+        for (file_id, generation, model_id, key) in legacy {
+            let marker = format!("|model={model_id}|context=");
+            let Some(context) = key
+                .split_once(&marker)
+                .and_then(|(_, suffix)| suffix.split('|').next())
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if !(512..=32768).contains(&context) {
+                continue;
+            }
+            let vectors = {
+                let mut stmt =
+                    db.prepare("SELECT vector,model_id FROM chunks WHERE file_id=?1 ORDER BY id")?;
+                stmt.query_map([file_id], |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if vectors.is_empty() {
+                continue;
+            }
+            let mut dimension = None;
+            let valid = vectors.iter().all(|(raw, chunk_model)| {
+                if chunk_model.as_deref() != Some(model_id.as_str()) {
+                    return false;
+                }
+                let Some(vector) = raw.as_deref().and_then(decode_vector) else {
+                    return false;
+                };
+                let norm_squared: f32 = vector.iter().map(|value| value * value).sum();
+                if vector.is_empty()
+                    || vector.iter().any(|value| !value.is_finite())
+                    || !norm_squared.is_finite()
+                    || norm_squared <= f32::EPSILON
+                    || dimension.is_some_and(|expected| expected != vector.len())
+                {
+                    return false;
+                }
+                dimension = Some(vector.len());
+                true
+            });
+            if valid {
+                migrated.push((file_id, generation, model_id, context as i64));
+            }
+        }
+        if migrated.is_empty() {
+            return Ok(());
+        }
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (file_id, generation, model_id, context) in migrated {
+            let complete: bool = tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM chunks WHERE file_id=?1
+                     AND (vector IS NULL OR model_id IS NOT ?2))",
+                params![file_id, model_id],
+                |row| row.get(0),
+            )?;
+            if !complete {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO file_embedding_context(file_id,generation,model_id,context_size)
+                 VALUES (?1,?2,?3,?4)",
+                params![file_id, generation, model_id, context],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO chunk_embedding_context(chunk_id,context_size)
+                 SELECT id,?2 FROM chunks WHERE file_id=?1 AND vector IS NOT NULL
+                   AND model_id=?3",
+                params![file_id, context, model_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn connect(&self) -> Result<Connection> {
@@ -197,6 +356,19 @@ impl Store {
             .collect();
         if let Some(key) = input.keys().find(|key| !known.contains(key.as_str())) {
             bail!("알 수 없는 설정입니다: {key}");
+        }
+        if let Some(value) = input.get("chat_enabled") {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("chat_enabled: true 또는 false가 필요합니다."))?;
+        }
+        if let Some(value) = input.get("gpu_mode") {
+            let mode = value
+                .as_str()
+                .ok_or_else(|| anyhow!("gpu_mode: auto 또는 cpu 문자열이 필요합니다."))?;
+            if !matches!(mode, "auto" | "cpu") {
+                bail!("gpu_mode: auto 또는 cpu를 선택하세요.");
+            }
         }
         if let Some(value) = input.get("filename_only_dirs") {
             let raw = value.as_str().ok_or_else(|| {
@@ -491,6 +663,80 @@ impl Store {
         }))
     }
 
+    pub(crate) fn file_content_on(db: &Connection, file_id: i64) -> Result<Option<ReusedContent>> {
+        let mut stmt = db.prepare(
+            "SELECT f.model_id,c.id,c.text,c.location,c.vector,c.model_id
+             FROM files f LEFT JOIN chunks c ON c.file_id=f.id
+             WHERE f.id=?1 AND f.status='content' AND f.error IS NULL ORDER BY c.id",
+        )?;
+        let rows = stmt
+            .query_map([file_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((_, _, _, _, _, _)) = rows.first() else {
+            return Ok(None);
+        };
+        let model_id = rows[0].0.clone();
+        let mut passages = Vec::new();
+        let mut vectors = Vec::new();
+        let mut vector_count = 0usize;
+        let mut vectors_valid = true;
+        for (_, chunk_id, text, location, raw, chunk_model_id) in rows {
+            let Some(_chunk_id) = chunk_id else {
+                continue;
+            };
+            let (Some(text), Some(location)) = (text, location) else {
+                return Ok(None);
+            };
+            passages.push(Passage { text, location });
+            if let Some(raw) = raw {
+                let valid_model = model_id.is_some() && chunk_model_id == model_id;
+                if !valid_model {
+                    vectors_valid = false;
+                    continue;
+                }
+                if let Some(vector) = decode_vector(&raw) {
+                    if !vector.is_empty()
+                        && vector.iter().all(|value| value.is_finite())
+                        && vector.iter().map(|value| value * value).sum::<f32>() > f32::EPSILON
+                    {
+                        vector_count += 1;
+                        vectors.push(vector);
+                    } else {
+                        vectors_valid = false;
+                    }
+                } else {
+                    vectors_valid = false;
+                }
+            } else {
+                vectors_valid = false;
+            }
+        }
+        let vectors = if passages.is_empty() || !vectors_valid || vector_count != passages.len() {
+            None
+        } else {
+            let dimension = vectors.first().map(Vec::len).unwrap_or(0);
+            if dimension == 0 || vectors.iter().any(|vector| vector.len() != dimension) {
+                None
+            } else {
+                Some(vectors)
+            }
+        };
+        Ok(Some(ReusedContent {
+            passages,
+            vectors,
+            model_id,
+        }))
+    }
+
     pub fn file_by_path(&self, path: &Path) -> Result<Option<Value>> {
         Self::file_by_path_on(&self.connect()?, path)
     }
@@ -504,6 +750,461 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Publish the path and current filesystem version before any content work.
+    /// Unchanged rows keep their body and vectors; changed rows invalidate both
+    /// atomically so stale text cannot appear under a new filename/version.
+    pub(crate) fn inventory_files_on(
+        db: &mut Connection,
+        records: &[InventoryRecord],
+    ) -> Result<(usize, usize)> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut changed_count, mut unchanged_count) = (0usize, 0usize);
+        for record in records {
+            let path = record.path.to_string_lossy().to_string();
+            let name = record
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let extension = record
+                .path
+                .extension()
+                .map(|value| format!(".{}", value.to_string_lossy().to_lowercase()))
+                .unwrap_or_default();
+            let old = tx
+                .query_row(
+                    "SELECT f.id,f.size,f.modified,f.status,f.reader_id,
+                            COALESCE(g.generation,0)
+                     FROM files f LEFT JOIN file_generations g ON g.file_id=f.id
+                     WHERE f.path=?1",
+                    [&path],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let unchanged = old
+                .as_ref()
+                .is_some_and(|(_, size, modified, status, reader, _)| {
+                    *size == record.size
+                        && *modified == record.modified
+                        && reader == &record.reader_id
+                        && status != "error"
+                });
+            if let Some((file_id, _, _, _, _, generation)) = old {
+                if unchanged {
+                    unchanged_count += 1;
+                    tx.execute(
+                        "UPDATE files SET root_id=?2 WHERE id=?1 AND root_id<>?2",
+                        params![file_id, record.root_id],
+                    )?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO file_generations(file_id,generation) VALUES (?1,?2)",
+                        params![file_id, generation],
+                    )?;
+                    continue;
+                }
+                changed_count += 1;
+                let generation = generation.saturating_add(1).max(1);
+                tx.execute(
+                    "UPDATE files SET root_id=?2,name=?3,extension=?4,size=?5,modified=?6,
+                         status='metadata',error=NULL,model_id=NULL,reader_id=?7 WHERE id=?1",
+                    params![
+                        file_id,
+                        record.root_id,
+                        name,
+                        extension,
+                        record.size,
+                        record.modified,
+                        record.reader_id,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO file_generations(file_id,generation) VALUES (?1,?2)
+                     ON CONFLICT(file_id) DO UPDATE SET generation=excluded.generation",
+                    params![file_id, generation],
+                )?;
+                tx.execute("DELETE FROM chunks WHERE file_id=?1", [file_id])?;
+                tx.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+                tx.execute(
+                    "DELETE FROM file_embedding_context WHERE file_id=?1",
+                    [file_id],
+                )?;
+            } else {
+                changed_count += 1;
+                tx.execute(
+                    "INSERT INTO files(root_id,path,name,extension,size,modified,status,error,model_id,reader_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,'metadata',NULL,NULL,?7)",
+                    params![
+                        record.root_id,
+                        path,
+                        name,
+                        extension,
+                        record.size,
+                        record.modified,
+                        record.reader_id,
+                    ],
+                )?;
+                let file_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO file_generations(file_id,generation) VALUES (?1,1)",
+                    [file_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok((changed_count, unchanged_count))
+    }
+
+    pub(crate) fn files_by_root_on(db: &Connection, root_id: i64) -> Result<Vec<IndexedFile>> {
+        let mut stmt = db.prepare(
+            "SELECT f.id,f.root_id,f.path,f.size,f.modified,f.status,f.model_id,f.reader_id,
+                    COALESCE(g.generation,0),e.context_size
+             FROM files f LEFT JOIN file_generations g ON g.file_id=f.id
+             LEFT JOIN file_embedding_context e ON e.file_id=f.id
+             WHERE f.root_id=?1 ORDER BY f.path",
+        )?;
+        let files = stmt
+            .query_map([root_id], |row| {
+                Ok(IndexedFile {
+                    id: row.get(0)?,
+                    root_id: row.get(1)?,
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    size: row.get(3)?,
+                    modified: row.get(4)?,
+                    status: row.get(5)?,
+                    model_id: row.get(6)?,
+                    reader_id: row.get(7)?,
+                    generation: row.get(8)?,
+                    embedding_context: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(files)
+    }
+
+    pub(crate) fn delete_file_generation_on(
+        db: &mut Connection,
+        file_id: i64,
+        generation: i64,
+    ) -> Result<bool> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM files WHERE id=?1 AND EXISTS(
+                 SELECT 1 FROM file_generations g WHERE g.file_id=files.id AND g.generation=?2
+             )",
+            params![file_id, generation],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    /// Store extracted text (and optional, already validated cached vectors).
+    /// This is a short version-checked transaction so FTS becomes searchable
+    /// before the later embedding queue starts.
+    pub(crate) fn write_content_on(
+        db: &mut Connection,
+        file_id: i64,
+        generation: i64,
+        passages: &[Passage],
+        vectors: Option<&[Vec<f32>]>,
+        model_id: Option<&str>,
+        context_size: u64,
+        error: Option<&str>,
+        content_key: Option<&str>,
+    ) -> Result<bool> {
+        if let Some(vectors) = vectors {
+            if vectors.len() != passages.len() {
+                bail!("임베딩 벡터 수가 문서 구간 수와 일치하지 않습니다.");
+            }
+        }
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status = if error.is_some() { "error" } else { "content" };
+        let updated = tx.execute(
+            "UPDATE files SET status=?3,error=?4,model_id=?5
+             WHERE id=?1 AND status='metadata'
+               AND EXISTS(SELECT 1 FROM file_generations g
+                          WHERE g.file_id=files.id AND g.generation=?2)",
+            params![file_id, generation, status, error, model_id],
+        )?;
+        if updated == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM chunks WHERE file_id=?1", [file_id])?;
+        for (index, passage) in passages.iter().enumerate() {
+            let vector = vectors.map(|values| encode_vector(&values[index]));
+            let chunk_model = vector.as_ref().map(|_| model_id);
+            let has_vector = vector.is_some();
+            tx.execute(
+                "INSERT INTO chunks(file_id,text,location,vector,model_id) VALUES (?1,?2,?3,?4,?5)",
+                params![file_id, passage.text, passage.location, vector, chunk_model],
+            )?;
+            if has_vector {
+                tx.execute(
+                    "INSERT INTO chunk_embedding_context(chunk_id,context_size) VALUES (?1,?2)",
+                    params![tx.last_insert_rowid(), context_size as i64],
+                )?;
+            }
+        }
+        if let (Some(model_id), Some(_)) = (model_id, vectors) {
+            tx.execute(
+                "INSERT INTO file_embedding_context(file_id,generation,model_id,context_size)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(file_id) DO UPDATE SET generation=excluded.generation,
+                     model_id=excluded.model_id,context_size=excluded.context_size",
+                params![file_id, generation, model_id, context_size as i64],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM file_embedding_context WHERE file_id=?1",
+                [file_id],
+            )?;
+        }
+        if error.is_none() {
+            if let Some(key) = content_key {
+                tx.execute(
+                    "INSERT INTO file_content_keys(file_id,content_key) VALUES (?1,?2)
+                     ON CONFLICT(file_id) DO UPDATE SET content_key=excluded.content_key",
+                    params![file_id, key],
+                )?;
+            } else {
+                tx.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+            }
+        } else {
+            tx.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn pending_embedding_chunks_on(
+        db: &Connection,
+        model_id: &str,
+        context_size: u64,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<EmbeddingChunk>> {
+        let mut stmt = db.prepare(
+            "SELECT c.id,c.file_id,COALESCE(g.generation,0),c.text
+             FROM chunks c JOIN files f ON f.id=c.file_id
+             LEFT JOIN file_generations g ON g.file_id=f.id
+             LEFT JOIN chunk_embedding_context ce ON ce.chunk_id=c.id
+             WHERE f.status='content'
+               AND c.id>?2 AND (c.vector IS NULL OR c.model_id IS NOT ?1
+                   OR ce.context_size IS NOT ?3)
+             ORDER BY c.id LIMIT ?4",
+        )?;
+        let chunks = stmt
+            .query_map(
+                params![model_id, after_id, context_size as i64, limit as i64],
+                |row| {
+                    Ok(EmbeddingChunk {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        generation: row.get(2)?,
+                        text: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(chunks)
+    }
+
+    pub(crate) fn embedding_counts_on(
+        db: &Connection,
+        model_id: &str,
+        context_size: u64,
+    ) -> Result<(u64, u64)> {
+        let (total, done) = db.query_row(
+            "SELECT count(*),sum(c.vector IS NOT NULL AND c.model_id=?1
+                  AND ce.context_size=?2)
+             FROM chunks c JOIN files f ON f.id=c.file_id
+             LEFT JOIN chunk_embedding_context ce ON ce.chunk_id=c.id
+             WHERE f.status='content'",
+            params![model_id, context_size as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
+        )?;
+        Ok((total.max(0) as u64, done.max(0) as u64))
+    }
+
+    /// Clear malformed vectors before queueing work. This also recovers rows
+    /// whose blob exists but cannot safely participate in semantic search.
+    pub(crate) fn reset_invalid_vectors_on(db: &mut Connection, model_id: &str) -> Result<u64> {
+        let invalid: Vec<i64> = {
+            let mut stmt = db
+                .prepare("SELECT id,vector FROM chunks WHERE vector IS NOT NULL AND model_id=?1")?;
+            stmt.query_map([model_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|item| match item {
+                Ok((id, raw)) => {
+                    let valid = decode_vector(&raw).is_some_and(|vector| {
+                        !vector.is_empty()
+                            && vector.iter().all(|value| value.is_finite())
+                            && vector
+                                .iter()
+                                .map(|value| value * value)
+                                .sum::<f32>()
+                                .is_finite()
+                            && vector.iter().map(|value| value * value).sum::<f32>() > f32::EPSILON
+                    });
+                    (!valid).then_some(Ok(id))
+                }
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if invalid.is_empty() {
+            return Ok(0);
+        }
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in &invalid {
+            tx.execute(
+                "UPDATE chunks SET vector=NULL,model_id=NULL WHERE id=?1 AND model_id=?2",
+                params![id, model_id],
+            )?;
+            tx.execute(
+                "DELETE FROM chunk_embedding_context WHERE chunk_id=?1",
+                [id],
+            )?;
+            tx.execute(
+                "UPDATE files SET model_id=NULL WHERE id=(SELECT file_id FROM chunks WHERE id=?1)",
+                [id],
+            )?;
+            tx.execute(
+                "DELETE FROM file_content_keys WHERE file_id=(SELECT file_id FROM chunks WHERE id=?1)",
+                [id],
+            )?;
+            tx.execute(
+                "DELETE FROM file_embedding_context WHERE file_id=(SELECT file_id FROM chunks WHERE id=?1)",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(invalid.len() as u64)
+    }
+
+    pub(crate) fn update_embedding_vectors_on(
+        db: &mut Connection,
+        updates: &[EmbeddingUpdate],
+        model_id: &str,
+        context_size: u64,
+    ) -> Result<(usize, HashSet<(i64, i64)>)> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut affected = HashSet::new();
+        let mut updated_count = 0usize;
+        for update in updates {
+            if update.vector.is_empty() || update.vector.iter().any(|value| !value.is_finite()) {
+                bail!("임베딩 결과가 비어 있거나 유한하지 않습니다.");
+            }
+            let raw = encode_vector(&update.vector);
+            let count = tx.execute(
+                "UPDATE chunks SET vector=?4,model_id=?5 WHERE id=?1 AND file_id=?2
+                 AND EXISTS(SELECT 1 FROM files f JOIN file_generations g ON g.file_id=f.id
+                            WHERE f.id=?2 AND f.status='content' AND g.generation=?3)",
+                params![update.id, update.file_id, update.generation, raw, model_id],
+            )?;
+            if count > 0 {
+                updated_count += count;
+                affected.insert((update.file_id, update.generation));
+                tx.execute(
+                    "INSERT INTO chunk_embedding_context(chunk_id,context_size) VALUES (?1,?2)
+                     ON CONFLICT(chunk_id) DO UPDATE SET context_size=excluded.context_size
+                     WHERE context_size<>excluded.context_size",
+                    params![update.id, context_size as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok((updated_count, affected))
+    }
+
+    pub(crate) fn set_content_key_for_generation_on(
+        db: &Connection,
+        file_id: i64,
+        generation: i64,
+        model_id: Option<&str>,
+        key: &str,
+    ) -> Result<()> {
+        db.execute(
+            "INSERT INTO file_content_keys(file_id,content_key)
+             SELECT f.id,?4 FROM files f JOIN file_generations g ON g.file_id=f.id
+             WHERE f.id=?1 AND f.status='content' AND f.model_id IS ?3
+               AND g.generation=?2
+             ON CONFLICT(file_id) DO UPDATE SET content_key=excluded.content_key",
+            params![file_id, generation, model_id, key],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_embedding_file_on(
+        db: &mut Connection,
+        file_id: i64,
+        generation: i64,
+        model_id: &str,
+        context_size: u64,
+        content_key: Option<&str>,
+    ) -> Result<bool> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let complete = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE id=?1 AND status='content'
+               AND EXISTS(SELECT 1 FROM file_generations g
+                          WHERE g.file_id=files.id AND g.generation=?2)
+               AND NOT EXISTS(SELECT 1 FROM chunks c LEFT JOIN chunk_embedding_context ce
+                              ON ce.chunk_id=c.id WHERE c.file_id=files.id
+                              AND (c.vector IS NULL OR c.model_id IS NOT ?3
+                                   OR ce.context_size IS NOT ?4)))",
+            params![file_id, generation, model_id, context_size as i64],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !complete {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE files SET model_id=?3 WHERE id=?1 AND status='content'
+               AND model_id IS NOT ?3
+               AND EXISTS(SELECT 1 FROM file_generations g
+                          WHERE g.file_id=files.id AND g.generation=?2)",
+            params![file_id, generation, model_id],
+        )?;
+        tx.execute(
+            "INSERT INTO file_embedding_context(file_id,generation,model_id,context_size)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(file_id) DO UPDATE SET generation=excluded.generation,
+                 model_id=excluded.model_id,context_size=excluded.context_size
+             WHERE generation<>excluded.generation OR model_id<>excluded.model_id
+                OR context_size<>excluded.context_size",
+            params![file_id, generation, model_id, context_size as i64],
+        )?;
+        if let Some(key) = content_key {
+            tx.execute(
+                "INSERT INTO file_content_keys(file_id,content_key) VALUES (?1,?2)
+                 ON CONFLICT(file_id) DO UPDATE SET content_key=excluded.content_key
+                 WHERE content_key<>excluded.content_key",
+                params![file_id, key],
+            )?;
+        } else {
+            tx.execute("DELETE FROM file_content_keys WHERE file_id=?1", [file_id])?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn file(&self, file_id: i64) -> Result<Option<Value>> {
@@ -1157,5 +1858,23 @@ mod tests {
                 "_site,temp"
             );
         }
+    }
+
+    #[test]
+    fn chat_and_gpu_settings_require_supported_types_and_values() {
+        let temp = test_tempdir("store-feature-settings-");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        assert!(
+            store
+                .update_settings(&json!({"chat_enabled":"false"}))
+                .is_err()
+        );
+        assert!(store.update_settings(&json!({"gpu_mode":true})).is_err());
+        assert!(store.update_settings(&json!({"gpu_mode":"cuda"})).is_err());
+        let saved = store
+            .update_settings(&json!({"chat_enabled":true,"gpu_mode":"cpu"}))
+            .unwrap();
+        assert_eq!(saved["chat_enabled"], true);
+        assert_eq!(saved["gpu_mode"], "cpu");
     }
 }

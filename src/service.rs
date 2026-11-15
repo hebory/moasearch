@@ -104,6 +104,12 @@ impl AppServices {
             }
             Command::Answer(input) => {
                 input.validate()?;
+                anyhow::ensure!(
+                    self.store.settings()?["chat_enabled"]
+                        .as_bool()
+                        .unwrap_or(false),
+                    "설정에서 AI 답변을 활성화하세요. 자연어 파일 검색에는 답변 모델이 필요하지 않습니다."
+                );
                 self.search
                     .answer_in(&input.query, input.limit.min(8), input.folder.as_deref())
             }
@@ -199,6 +205,14 @@ impl AppServices {
             !self.shutting_down.load(Ordering::Acquire),
             "모아검색을 종료하는 중입니다."
         );
+        if kind == "chat" {
+            anyhow::ensure!(
+                self.store.settings()?["chat_enabled"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "설정에서 AI 답변을 활성화한 뒤 Gemma 답변 모델을 준비하세요."
+            );
+        }
         anyhow::ensure!(
             ["embedding", "chat", "ocr"].contains(&kind.as_str()),
             "알 수 없는 모델입니다."
