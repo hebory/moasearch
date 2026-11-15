@@ -116,6 +116,7 @@
     const end=Math.min(list.length,start+visibleRows);
     state.virtualStart=start;
     const oldCards=new Map(Array.from(dom.resultsList.querySelectorAll('.result-card')).map(card=>[card.getAttribute('data-result-id'),card]));
+    const activeElement=document.activeElement,activeResultId=activeElement?.className?.includes('result-card')?activeElement.getAttribute('data-result-id'):null;
     const oldTop=Array.from(dom.resultsList.children).find(child=>child.className.includes('list-spacer-top'));
     const oldBottom=Array.from(dom.resultsList.children).find(child=>child.className.includes('list-spacer-bottom'));
     const nodes=[];
@@ -125,6 +126,8 @@
     if(!list.length){const empty=element('div','results-empty',state.browse.loading?'파일 목록을 불러오는 중…':state.browse.failed?'파일 목록을 불러오지 못했어요':state.folder?'이 폴더와 하위 폴더에 파일이 없습니다':'검색 위치를 추가하면 파일 목록을 볼 수 있습니다.');if(state.browse.failed)empty.append(browseRetryButton());nodes.push(empty);}
     else if(state.browse.failed){const retry=element('div','results-empty','다음 파일 페이지를 불러오지 못했어요.');retry.append(browseRetryButton());nodes.push(retry);}
     dom.resultsList.replaceChildren(...nodes);
+    dom.resultsList.scrollTop=scrollTop;
+    if(activeResultId!==null){const focused=Array.from(dom.resultsList.querySelectorAll('.result-card')).find(card=>card.getAttribute('data-result-id')===activeResultId);focused?.focus({preventScroll:true});}
     updateBrowseTitle();
   }
   function beginBrowseLoad() {

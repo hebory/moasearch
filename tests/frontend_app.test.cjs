@@ -22,6 +22,7 @@ class Element {
     this.scrollTop = 0;
     this.clientHeight = 290;
     this.scrollHeight = 290;
+    this.resetScrollOnReplace = false;
     this.classList = {
       add: (...names) => names.forEach(name => this.classList._set.add(name)),
       remove: (...names) => names.forEach(name => this.classList._set.delete(name)),
@@ -51,7 +52,7 @@ class Element {
   }
 
   append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = [...children]; }
+  replaceChildren(...children) { if (this.ownerDocument && this.children.includes(this.ownerDocument.activeElement)) this.ownerDocument.activeElement = null; this.children = [...children]; if (this.resetScrollOnReplace) this.scrollTop = 0; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   removeAttribute(name) { this.attributes.delete(name); }
@@ -64,7 +65,7 @@ class Element {
     if (selector === '.result-card') return this.children.filter(child => child.className.includes('result-card'));
     return [];
   }
-  focus() { this.focused = true; }
+  focus(options) { this.focused = true; this.focusOptions = options; if (this.ownerDocument) this.ownerDocument.activeElement = this; }
   select() { this.textSelected = true; }
   scrollIntoView() {}
   showModal() { this.open = true; }
@@ -115,10 +116,11 @@ function createApp() {
   const document = {
     activeElement: null,
     getElementById: id => elements.get(id) || null,
-    createElement: tag => new Element(tag),
+    createElement: tag => { const element = new Element(tag); element.ownerDocument = document; return element; },
     querySelectorAll: selector => selector === '.mode-button' ? modeButtons : [],
     addEventListener(name, handler) { documentListeners.set(name, handler); },
   };
+  for (const element of elements.values()) element.ownerDocument = document;
   const timers = new Map();
   let nextTimer = 0;
   const setTimer = (handler, delay) => {
@@ -278,6 +280,8 @@ test('loads the blank-query file list in cursor pages while virtual rows preserv
   assert.ok(selected);
   selected.dispatch('click');
   assert.equal(selected.getAttribute('aria-selected'), 'true');
+  selected.focus();
+  list.resetScrollOnReplace = true;
   list.scrollHeight = 200 * 29;
   list.scrollTop = list.scrollHeight - list.clientHeight - 10;
   list.dispatch('scroll');
@@ -289,6 +293,8 @@ test('loads the blank-query file list in cursor pages while virtual rows preserv
   assert.ok(rows.length <= 100);
   assert.ok(rows.includes(selected), 'page append keeps unchanged visible row nodes');
   assert.equal(selected.getAttribute('aria-selected'), 'true', 'page append keeps selected file');
+  assert.equal(app.document.activeElement, selected, 'page append restores keyboard focus to the active file row');
+  assert.equal(selected.focusOptions.preventScroll, true);
   assert.match(app.elements.get('results-title').textContent, /400개 불러옴/);
   assert.equal(list.scrollTop, list.scrollHeight - list.clientHeight - 10, 'append preserves the user scroll position');
   const pagesBeforeResize = app.call('list_files').length;
