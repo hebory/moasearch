@@ -42,6 +42,30 @@ pub struct ListCursor {
     pub revision: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchPageInput {
+    pub query: String,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub cursor: Option<SearchPageCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchPageCursor {
+    pub snapshot_id: String,
+    pub offset: usize,
+    pub revision: i64,
+}
+
 fn default_list_limit() -> usize {
     200
 }
@@ -93,6 +117,46 @@ impl ListFilesInput {
     }
 }
 
+impl SearchPageInput {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.query.trim().is_empty() && self.query.chars().count() <= 2000,
+            "검색어는 1~2000자여야 합니다."
+        );
+        anyhow::ensure!(
+            (1..=500).contains(&self.limit),
+            "검색 결과 페이지 크기는 1~500개여야 합니다."
+        );
+        anyhow::ensure!(
+            ["hybrid", "keyword", "instant"].contains(&self.mode.as_str()),
+            "알 수 없는 검색 방식입니다."
+        );
+        anyhow::ensure!(
+            self.extension
+                .as_ref()
+                .is_none_or(|value| value.len() <= 30),
+            "확장자가 너무 깁니다."
+        );
+        if let Some(folder) = &self.folder {
+            let path = folder.to_string_lossy();
+            anyhow::ensure!(
+                !path.trim().is_empty() && path.chars().count() <= 32767 && !path.contains('\0'),
+                "폴더 경로가 올바르지 않습니다."
+            );
+        }
+        if let Some(cursor) = &self.cursor {
+            anyhow::ensure!(
+                !cursor.snapshot_id.trim().is_empty()
+                    && cursor.snapshot_id.len() <= 128
+                    && cursor.offset > 0
+                    && cursor.revision >= 0,
+                "검색 cursor가 올바르지 않습니다."
+            );
+        }
+        Ok(())
+    }
+}
+
 impl SearchInput {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
@@ -131,6 +195,7 @@ pub enum Command {
     CancelIndex {},
     UpdateSettings { settings: Value },
     Search(SearchInput),
+    SearchPage(SearchPageInput),
     ListFiles(ListFilesInput),
     Answer(SearchInput),
     File { id: i64 },

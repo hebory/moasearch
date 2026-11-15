@@ -2,25 +2,189 @@
 mod intent;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use rusqlite::{Connection, params_from_iter};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::commands::SearchPageCursor;
 use crate::engine::Embedder;
 use crate::store::{Store, decode_vector};
 
 const DEFAULT_VECTOR_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const QUERY_CACHE_SIZE: usize = 64;
 const LEXICAL_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const SEARCH_SNAPSHOT_MEMORY_BYTES: usize = 4 * 1024 * 1024;
+const SEARCH_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SEARCH_SNAPSHOT_CACHE_COUNT: usize = 8;
+const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(10 * 60);
+const SEARCH_SNAPSHOT_CHECKPOINT_ROWS: usize = 128;
 // Conservative defaults evaluated with the pinned EmbeddingGemma 2 Q8_0.
 // Cosine is a model-specific ranking signal, not a probability of relevance.
 const MIN_SEMANTIC_SIMILARITY: f32 = 0.70;
 const MAX_SEMANTIC_DISTANCE_FROM_BEST: f32 = 0.05;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SearchPageEntry {
+    id: i64,
+    score: f64,
+    match_type: String,
+    snippet: String,
+    location: String,
+    semantic_score: Option<f64>,
+}
+
+enum SearchPageEntries {
+    Memory(Vec<SearchPageEntry>),
+    Spill {
+        file: Mutex<File>,
+        checkpoints: Vec<u64>,
+        count: usize,
+    },
+}
+
+struct SearchPageSnapshot {
+    signature: u64,
+    revision: i64,
+    mode: String,
+    intent: Option<String>,
+    warnings: Vec<String>,
+    total: usize,
+    entries: SearchPageEntries,
+    estimated_bytes: usize,
+}
+
+struct CachedSearchPage {
+    snapshot: Arc<SearchPageSnapshot>,
+    last_used: Instant,
+}
+
+impl SearchPageSnapshot {
+    fn page(&self, offset: usize, limit: usize) -> Result<Vec<SearchPageEntry>> {
+        if offset > self.total {
+            return Err(anyhow!("검색 cursor 위치가 올바르지 않습니다."));
+        }
+        if offset == self.total {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(limit).min(self.total);
+        match &self.entries {
+            SearchPageEntries::Memory(entries) => Ok(entries[offset..end].to_vec()),
+            SearchPageEntries::Spill {
+                file,
+                checkpoints,
+                count,
+            } => {
+                if *count != self.total {
+                    return Err(anyhow!("검색 snapshot이 손상되었습니다."));
+                }
+                let checkpoint = offset / SEARCH_SNAPSHOT_CHECKPOINT_ROWS;
+                let start = checkpoint * SEARCH_SNAPSHOT_CHECKPOINT_ROWS;
+                let byte_offset = *checkpoints
+                    .get(checkpoint)
+                    .ok_or_else(|| anyhow!("검색 snapshot index가 올바르지 않습니다."))?;
+                let mut file = file.lock().unwrap();
+                file.seek(SeekFrom::Start(byte_offset))?;
+                let mut reader = BufReader::new(&mut *file);
+                let mut line = String::new();
+                for _ in start..offset {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        return Err(anyhow!("검색 snapshot이 예상보다 짧습니다."));
+                    }
+                }
+                let mut entries = Vec::with_capacity(end - offset);
+                for _ in offset..end {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        return Err(anyhow!("검색 snapshot이 예상보다 짧습니다."));
+                    }
+                    entries.push(serde_json::from_str(&line)?);
+                }
+                Ok(entries)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SearchPageCache {
+    entries: HashMap<String, CachedSearchPage>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl SearchPageCache {
+    fn get(&mut self, id: &str) -> Option<Arc<SearchPageSnapshot>> {
+        self.expire();
+        let entry = self.entries.get_mut(id)?;
+        entry.last_used = Instant::now();
+        let snapshot = entry.snapshot.clone();
+        self.order.retain(|candidate| candidate != id);
+        self.order.push_back(id.to_string());
+        Some(snapshot)
+    }
+
+    fn insert(&mut self, id: String, snapshot: Arc<SearchPageSnapshot>) {
+        self.expire();
+        let bytes = snapshot.estimated_bytes;
+        while self.entries.len() >= SEARCH_SNAPSHOT_CACHE_COUNT
+            || (self.bytes.saturating_add(bytes) > SEARCH_SNAPSHOT_CACHE_BYTES
+                && !self.entries.is_empty())
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(entry.snapshot.estimated_bytes);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.order.push_back(id.clone());
+        self.entries.insert(
+            id,
+            CachedSearchPage {
+                snapshot,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(entry) = self.entries.remove(id) {
+            self.bytes = self.bytes.saturating_sub(entry.snapshot.estimated_bytes);
+        }
+        self.order.retain(|candidate| candidate != id);
+    }
+
+    fn expire(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.last_used) > SEARCH_SNAPSHOT_TTL)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            if let Some(entry) = self.entries.remove(&id) {
+                self.bytes = self.bytes.saturating_sub(entry.snapshot.estimated_bytes);
+            }
+            self.order.retain(|candidate| candidate != &id);
+        }
+    }
+}
 
 #[derive(Debug)]
 struct VectorRow {
@@ -47,7 +211,6 @@ impl VectorSnapshot {
         query: &[f32],
         extension: Option<&str>,
         folder: Option<&Path>,
-        file_limit: usize,
     ) -> Vec<(f32, i64)> {
         if self.dimension != query.len() {
             return Vec::new();
@@ -81,7 +244,6 @@ impl VectorSnapshot {
         }
         let mut candidates: Vec<_> = best_by_file.into_values().collect();
         candidates.sort_by(compare_candidate_desc);
-        candidates.truncate(file_limit);
         candidates
     }
 }
@@ -422,6 +584,8 @@ pub struct Search {
     vectors: Mutex<VectorCache>,
     query_vectors: Mutex<QueryCache>,
     lexical: Mutex<LexicalCache>,
+    search_pages: Mutex<SearchPageCache>,
+    next_search_page_id: AtomicU64,
     vector_cache_bytes: usize,
 }
 
@@ -441,6 +605,8 @@ impl Search {
             vectors: Mutex::new(VectorCache::default()),
             query_vectors: Mutex::new(QueryCache::default()),
             lexical: Mutex::new(LexicalCache::default()),
+            search_pages: Mutex::new(SearchPageCache::default()),
+            next_search_page_id: AtomicU64::new(1),
             vector_cache_bytes,
         }
     }
@@ -463,11 +629,240 @@ impl Search {
         mode: &str,
         folder: Option<&Path>,
     ) -> Result<Value> {
+        let (mut response, _) = self.search_complete(query, extension, mode, folder)?;
+        response["results"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("검색 결과 형식이 올바르지 않습니다."))?
+            .truncate(limit.clamp(1, 100));
+        Ok(response)
+    }
+
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        extension: Option<&str>,
+        mode: &str,
+        folder: Option<&Path>,
+        cursor: Option<&SearchPageCursor>,
+    ) -> Result<Value> {
         let query = query.trim();
         if query.is_empty() || query.chars().count() > 2000 {
             return Err(anyhow!("검색어는 1~2,000자로 입력하세요."));
         }
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, 500);
+        let folder = folder.map(canonical_folder).transpose()?;
+        let folder = folder.as_deref();
+        let extension = extension
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!(".{}", value.trim().trim_start_matches('.').to_lowercase()));
+        let settings = self.store.settings()?;
+        let signature = search_page_signature(
+            query,
+            extension.as_deref(),
+            folder,
+            mode,
+            self.engine.model_id().as_deref(),
+            &settings,
+        );
+
+        if let Some(cursor) = cursor {
+            let snapshot = self.search_pages.lock().unwrap().get(&cursor.snapshot_id);
+            let current_revision = Store::lexical_revision_on(&self.store.connect()?)?;
+            let Some(snapshot) = snapshot else {
+                return Ok(search_page_reset(
+                    current_revision,
+                    0,
+                    mode,
+                    matches!(mode, "hybrid" | "instant") && intent::is_source_code_query(query),
+                    Vec::new(),
+                ));
+            };
+            if cursor.revision != snapshot.revision || current_revision != snapshot.revision {
+                self.search_pages
+                    .lock()
+                    .unwrap()
+                    .remove(&cursor.snapshot_id);
+                return Ok(search_page_reset(
+                    current_revision,
+                    snapshot.total,
+                    &snapshot.mode,
+                    snapshot.intent.as_deref() == Some("source_code"),
+                    snapshot.warnings.clone(),
+                ));
+            }
+            if signature != snapshot.signature || cursor.offset > snapshot.total {
+                return Ok(search_page_reset(
+                    current_revision,
+                    0,
+                    mode,
+                    matches!(mode, "hybrid" | "instant") && intent::is_source_code_query(query),
+                    Vec::new(),
+                ));
+            }
+            return self.search_page_response(&cursor.snapshot_id, &snapshot, cursor.offset, limit);
+        }
+
+        let (response, revision) =
+            self.search_complete(query, extension.as_deref(), mode, folder)?;
+        let response_results = response["results"]
+            .as_array()
+            .ok_or_else(|| anyhow!("검색 결과 형식이 올바르지 않습니다."))?;
+        let total = response_results.len();
+        if total <= limit {
+            return Ok(json!({
+                "results":response_results,"total":total,"next_cursor":null,"revision":revision,
+                "reset_required":false,"mode":response["mode"],"intent":response["intent"],
+                "warnings":response["warnings"]
+            }));
+        }
+        let first_page = response_results[..limit].to_vec();
+        let mut entries = Vec::new();
+        for result in response_results {
+            entries.push(SearchPageEntry {
+                id: result["id"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow!("검색 결과 파일 ID가 올바르지 않습니다."))?,
+                score: result["score"].as_f64().unwrap_or_default(),
+                match_type: result["match_type"]
+                    .as_str()
+                    .unwrap_or("filename")
+                    .to_string(),
+                snippet: result["snippet"].as_str().unwrap_or_default().to_string(),
+                location: result["location"].as_str().unwrap_or_default().to_string(),
+                semantic_score: result["semantic_score"].as_f64(),
+            });
+        }
+        let storage = store_search_page_entries(&self.store.data_dir, entries)?;
+        let snapshot = Arc::new(SearchPageSnapshot {
+            signature,
+            revision,
+            mode: response["mode"].as_str().unwrap_or("keyword").to_string(),
+            intent: response["intent"].as_str().map(str::to_string),
+            warnings: response["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            total,
+            estimated_bytes: storage.1,
+            entries: storage.0,
+        });
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let serial = self
+            .next_search_page_id
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let snapshot_id = format!("{timestamp:x}-{serial:x}");
+        self.search_pages
+            .lock()
+            .unwrap()
+            .insert(snapshot_id.clone(), snapshot.clone());
+        let next_cursor = SearchPageCursor {
+            snapshot_id,
+            offset: first_page.len(),
+            revision,
+        };
+        Ok(json!({
+            "results":first_page,"total":total,"next_cursor":next_cursor,"revision":revision,
+            "reset_required":false,"mode":snapshot.mode,"intent":snapshot.intent,
+            "warnings":snapshot.warnings
+        }))
+    }
+
+    fn search_page_response(
+        &self,
+        snapshot_id: &str,
+        snapshot: &SearchPageSnapshot,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let entries = snapshot.page(offset, limit)?;
+        let mut db = self.store.connect()?;
+        let tx = db.transaction()?;
+        let revision = Store::lexical_revision_on(&tx)?;
+        if revision != snapshot.revision {
+            tx.commit()?;
+            self.search_pages.lock().unwrap().remove(snapshot_id);
+            return Ok(search_page_reset(
+                revision,
+                snapshot.total,
+                &snapshot.mode,
+                snapshot.intent.as_deref() == Some("source_code"),
+                snapshot.warnings.clone(),
+            ));
+        }
+        let ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+        let mut files = HashMap::new();
+        if !ids.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT f.* FROM files f WHERE f.id IN ({placeholders})");
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(ids.iter()), crate::store::row_json)?;
+            for row in rows {
+                let file = row?;
+                if let Some(id) = file["id"].as_i64() {
+                    files.insert(id, file);
+                }
+            }
+        }
+        if files.len() != ids.len() {
+            tx.commit()?;
+            return Ok(search_page_reset(
+                revision,
+                snapshot.total,
+                &snapshot.mode,
+                snapshot.intent.as_deref() == Some("source_code"),
+                snapshot.warnings.clone(),
+            ));
+        }
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut file = files
+                .remove(&entry.id)
+                .ok_or_else(|| anyhow!("검색 snapshot 파일이 더 이상 없습니다."))?;
+            file.as_object_mut().unwrap().remove("model_id");
+            file["score"] = json!(entry.score);
+            file["match_type"] = json!(entry.match_type);
+            file["snippet"] = json!(entry.snippet);
+            file["location"] = json!(entry.location);
+            if let Some(score) = entry.semantic_score {
+                file["semantic_score"] = json!(score);
+            }
+            results.push(file);
+        }
+        tx.commit()?;
+        let end = offset.saturating_add(results.len());
+        let next_cursor = (end < snapshot.total).then(|| SearchPageCursor {
+            snapshot_id: snapshot_id.to_string(),
+            offset: end,
+            revision: snapshot.revision,
+        });
+        Ok(json!({
+            "results":results,"total":snapshot.total,"next_cursor":next_cursor,
+            "revision":snapshot.revision,"reset_required":false,"mode":snapshot.mode,
+            "intent":snapshot.intent,"warnings":snapshot.warnings
+        }))
+    }
+
+    fn search_complete(
+        &self,
+        query: &str,
+        extension: Option<&str>,
+        mode: &str,
+        folder: Option<&Path>,
+    ) -> Result<(Value, i64)> {
+        let query = query.trim();
+        if query.is_empty() || query.chars().count() > 2000 {
+            return Err(anyhow!("검색어는 1~2,000자로 입력하세요."));
+        }
         let folder = folder.map(canonical_folder).transpose()?;
         let folder = folder.as_deref();
         // The first, non-model response must use exactly the same lexical
@@ -506,12 +901,19 @@ impl Search {
         let extension = extension
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!(".{}", value.trim().trim_start_matches('.').to_lowercase()));
-        let lexical = self.lexical_hits(LexicalKey {
-            terms: keyword_terms,
-            extension: extension.clone(),
-            folder: folder.map(Path::to_path_buf),
-            source_code: source_code_intent,
-        })?;
+        let mut db = self.store.connect()?;
+        let tx = db.transaction()?;
+        let revision = Store::lexical_revision_on(&tx)?;
+        let lexical = self.lexical_hits_on(
+            &tx,
+            revision,
+            LexicalKey {
+                terms: keyword_terms,
+                extension: extension.clone(),
+                folder: folder.map(Path::to_path_buf),
+                source_code: source_code_intent,
+            },
+        )?;
         let mut hits = lexical.hits;
         let mut next_hit_order = lexical.next_order;
         let mut warnings = Vec::<String>::new();
@@ -519,7 +921,7 @@ impl Search {
         let mut actual_mode = "keyword";
         if mode == "hybrid" && !source_code_intent {
             if let Some(model_id) = self.engine.model_id() {
-                let has_vectors: bool = self.store.connect()?.query_row(
+                let has_vectors: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM chunks WHERE model_id=?1 AND vector IS NOT NULL)",
                     [&model_id],
                     |row| row.get(0),
@@ -529,12 +931,12 @@ impl Search {
                 } else {
                     match self.query_vector(&model_id, query) {
                         Ok(query_vector) => {
-                            match self.semantic_search(
+                            match self.semantic_search_on(
+                                &tx,
                                 &model_id,
                                 &query_vector,
                                 extension.as_deref(),
                                 folder,
-                                limit,
                                 &mut hits,
                                 &mut next_hit_order,
                             ) {
@@ -569,7 +971,6 @@ impl Search {
                 .total_cmp(&a.score)
                 .then_with(|| a.first_seen.cmp(&b.first_seen))
         });
-        sorted.truncate(limit);
         let output: Vec<Value> = sorted
             .into_iter()
             .map(|hit| {
@@ -578,22 +979,27 @@ impl Search {
                 item["score"] = json!(hit.score);
                 item["match_type"] = json!(hit.match_type);
                 item["snippet"] = json!(preview(&text, &terms, 360));
-                item.as_object_mut().unwrap().remove("model_id");
+                let object = item.as_object_mut().unwrap();
+                object.remove("model_id");
+                object.remove("text");
                 item
             })
             .collect();
-        Ok(
+        tx.commit()?;
+        Ok((
             json!({"results":output,"mode":if source_code_intent {"hybrid"} else {actual_mode},"intent":if source_code_intent {Some("source_code")} else {None},"warnings":warnings}),
-        )
+            revision,
+        ))
     }
 
-    fn lexical_hits(&self, key: LexicalKey) -> Result<LexicalHits> {
-        let mut db = self.store.connect()?;
-        let tx = db.transaction()?;
-        let revision = Store::lexical_revision_on(&tx)?;
+    fn lexical_hits_on(
+        &self,
+        db: &Connection,
+        revision: i64,
+        key: LexicalKey,
+    ) -> Result<LexicalHits> {
         let cached = self.lexical.lock().unwrap().get(revision, &key);
         if let Some(cached) = cached {
-            tx.commit()?;
             return Ok((*cached).clone());
         }
         let mut value = LexicalHits {
@@ -601,7 +1007,7 @@ impl Search {
             next_order: 0,
         };
         keyword_search(
-            &tx,
+            db,
             &key.terms,
             key.extension.as_deref(),
             key.folder.as_deref(),
@@ -610,7 +1016,7 @@ impl Search {
         )?;
         if key.source_code {
             for (rank, mut file) in
-                intent::source_code_files(&tx, key.extension.as_deref(), key.folder.as_deref())?
+                intent::source_code_files(db, key.extension.as_deref(), key.folder.as_deref())?
                     .into_iter()
                     .enumerate()
             {
@@ -629,7 +1035,6 @@ impl Search {
                 );
             }
         }
-        tx.commit()?;
         // Accounting and deep copies stay outside the cache mutex. Only the
         // lexical revision invalidates this cache; background vector updates
         // keep instant and semantic requests on the same lexical snapshot.
@@ -701,36 +1106,27 @@ impl Search {
         Ok(vector)
     }
 
-    fn semantic_search(
+    fn semantic_search_on(
         &self,
+        db: &Connection,
         model_id: &str,
         query: &[f32],
         extension: Option<&str>,
         folder: Option<&Path>,
-        limit: usize,
         hits: &mut HashMap<i64, Hit>,
         next_hit_order: &mut usize,
     ) -> Result<(bool, i64)> {
-        let mut db = self.store.connect()?;
-        let tx = db.transaction()?;
-        let state = Store::index_state_on(&tx)?;
+        let state = Store::index_state_on(db)?;
         let revision = state["revision"]
             .as_i64()
             .ok_or_else(|| anyhow!("색인 버전이 올바르지 않습니다."))?;
-        let candidate_limit = (limit * 3).max(60);
         let snapshot = {
             let mut cache = self.vectors.lock().unwrap();
-            cache.get_or_build(
-                &tx,
-                model_id,
-                query.len(),
-                revision,
-                self.vector_cache_bytes,
-            )?
+            cache.get_or_build(db, model_id, query.len(), revision, self.vector_cache_bytes)?
         };
         let ranked = match snapshot {
-            Some(snapshot) => snapshot.candidates(query, extension, folder, candidate_limit),
-            None => streaming_candidates(&tx, model_id, query, extension, folder, candidate_limit)?,
+            Some(snapshot) => snapshot.candidates(query, extension, folder),
+            None => streaming_candidates(db, model_id, query, extension, folder)?,
         };
         let has_candidates = !ranked.is_empty();
         let minimum = semantic_minimum(ranked.first().map(|(score, _)| *score));
@@ -738,18 +1134,18 @@ impl Search {
             .into_iter()
             .filter(|(score, _)| *score >= minimum)
             .collect();
-        let placeholders = std::iter::repeat("?")
-            .take(ranked.len())
-            .collect::<Vec<_>>()
-            .join(",");
         let mut found = HashMap::<i64, Value>::new();
-        if !ranked.is_empty() {
-            let ids: Vec<i64> = ranked.iter().map(|(_, id)| *id).collect();
+        for batch in ranked.chunks(500) {
+            let ids: Vec<i64> = batch.iter().map(|(_, id)| *id).collect();
+            let placeholders = std::iter::repeat("?")
+                .take(ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "SELECT f.*,c.id AS result_chunk_id,c.text,c.location FROM chunks c
                  JOIN files f ON f.id=c.file_id WHERE c.id IN ({placeholders})"
             );
-            let mut statement = tx.prepare(&sql)?;
+            let mut statement = db.prepare(&sql)?;
             let mapped = statement.query_map(params_from_iter(ids.iter()), |row| {
                 let mut item = crate::store::row_json(row)?;
                 item["result_chunk_id"] = json!(row.get::<_, i64>(11)?);
@@ -771,9 +1167,99 @@ impl Search {
                 add_hit(hits, item, Some(text), rank + 1, "semantic", next_hit_order);
             }
         }
-        tx.commit()?;
         Ok((has_candidates, revision))
     }
+}
+
+fn search_page_signature(
+    query: &str,
+    extension: Option<&str>,
+    folder: Option<&Path>,
+    mode: &str,
+    model_id: Option<&str>,
+    settings: &Value,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let folder_key = folder.map(|path| {
+        let value = path.to_string_lossy();
+        #[cfg(windows)]
+        {
+            value.to_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            value.into_owned()
+        }
+    });
+    query.hash(&mut hasher);
+    extension.hash(&mut hasher);
+    folder_key.hash(&mut hasher);
+    mode.hash(&mut hasher);
+    model_id.hash(&mut hasher);
+    settings.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn store_search_page_entries(
+    data_dir: &Path,
+    entries: Vec<SearchPageEntry>,
+) -> Result<(SearchPageEntries, usize)> {
+    store_search_page_entries_with_budget(data_dir, entries, SEARCH_SNAPSHOT_MEMORY_BYTES)
+}
+
+fn store_search_page_entries_with_budget(
+    data_dir: &Path,
+    entries: Vec<SearchPageEntry>,
+    memory_budget: usize,
+) -> Result<(SearchPageEntries, usize)> {
+    let estimated_bytes = entries.iter().fold(0usize, |bytes, entry| {
+        bytes
+            .saturating_add(std::mem::size_of::<SearchPageEntry>())
+            .saturating_add(entry.match_type.len())
+            .saturating_add(entry.snippet.len())
+            .saturating_add(entry.location.len())
+    });
+    if estimated_bytes <= memory_budget {
+        return Ok((SearchPageEntries::Memory(entries), estimated_bytes));
+    }
+
+    let mut file = tempfile::tempfile_in(data_dir)
+        .map_err(|error| anyhow!("검색 결과 임시 저장소를 만들 수 없습니다: {error}"))?;
+    let mut checkpoints = Vec::new();
+    let mut spilled_bytes = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        if index % SEARCH_SNAPSHOT_CHECKPOINT_ROWS == 0 {
+            checkpoints.push(file.stream_position()?);
+        }
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")?;
+        spilled_bytes = file.stream_position()?.try_into().unwrap_or(usize::MAX);
+    }
+    file.flush()?;
+    let count = entries.len();
+    drop(entries);
+    Ok((
+        SearchPageEntries::Spill {
+            file: Mutex::new(file),
+            checkpoints,
+            count,
+        },
+        spilled_bytes,
+    ))
+}
+
+fn search_page_reset(
+    revision: i64,
+    total: usize,
+    mode: &str,
+    is_source_code: bool,
+    warnings: Vec<String>,
+) -> Value {
+    json!({
+        "results":[],"total":total,"next_cursor":null,"revision":revision,
+        "reset_required":true,"mode":if is_source_code {"hybrid"} else {mode},
+        "intent":if is_source_code {Some("source_code")} else {None},"warnings":warnings
+    })
 }
 
 fn semantic_minimum(best: Option<f32>) -> f32 {
@@ -844,7 +1330,7 @@ fn keyword_search(
     }
     let path_clause = path_parts.join(" OR ");
     let path_query = format!(
-        "SELECT f.*, '' AS text, '파일명·경로' AS location FROM files f WHERE ({path_clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC LIMIT 300"
+        "SELECT f.*, '' AS text, '파일명·경로' AS location FROM files f WHERE ({path_clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC,f.id"
     );
     let path_extension = extension.map(str::to_string);
     let mut path_values: Vec<&dyn rusqlite::ToSql> = path_params.iter().map(|s| s as _).collect();
@@ -875,6 +1361,7 @@ fn keyword_search(
         name_match_count(b, terms)
             .cmp(&name_match_count(a, terms))
             .then_with(|| b["modified"].as_i64().cmp(&a["modified"].as_i64()))
+            .then_with(|| a["id"].as_i64().cmp(&b["id"].as_i64()))
     });
     for (rank, row) in path_rows.into_iter().enumerate() {
         let text = row["text"].as_str().unwrap_or_default().to_string();
@@ -885,13 +1372,16 @@ fn keyword_search(
         .iter()
         .filter(|term| term.chars().count() >= 3)
         .collect();
-    let mut content_rows = Vec::new();
+    // FTS hits are ordered by BM25 and short-token hits by file recency. Keep
+    // the first row for each file in that order, but never collect every
+    // matching chunk's full text in memory.
+    let mut seen_content_files = HashSet::new();
     if !long_terms.is_empty() {
         let expression = fts_expression(long_terms.iter().map(|s| s.as_str()));
         let sql = format!(
             "SELECT f.*,c.text,c.location FROM chunks_fts
              JOIN chunks c ON c.id=chunks_fts.rowid JOIN files f ON f.id=c.file_id
-             WHERE chunks_fts MATCH ?{ext_sql}{folder_sql} ORDER BY bm25(chunks_fts) LIMIT 400"
+             WHERE chunks_fts MATCH ?{ext_sql}{folder_sql} ORDER BY bm25(chunks_fts),f.id,c.id"
         );
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&expression];
         let fts_extension = extension.map(str::to_string);
@@ -902,10 +1392,28 @@ fn keyword_search(
             values.push(pattern);
         }
         let mut stmt = db.prepare(&sql)?;
-        content_rows.extend(
-            stmt.query_map(params_from_iter(values), joined_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
+        let mut rows = stmt.query(params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            if seen_content_files.contains(&id) {
+                continue;
+            }
+            let path = row.get::<_, String>(2)?;
+            if folder.is_some_and(|folder| !folder_contains_path(folder, Path::new(&path))) {
+                continue;
+            }
+            seen_content_files.insert(id);
+            let file = joined_row(row)?;
+            let text = file["text"].as_str().unwrap_or_default().to_string();
+            add_hit(
+                hits,
+                file,
+                Some(text),
+                seen_content_files.len(),
+                "keyword",
+                next_hit_order,
+            );
+        }
     }
     let short_terms: Vec<_> = terms
         .iter()
@@ -918,7 +1426,7 @@ fn keyword_search(
             .join(" OR ");
         let sql = format!(
             "SELECT f.*,c.text,c.location FROM chunks c JOIN files f ON f.id=c.file_id
-             WHERE ({clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC LIMIT 200"
+             WHERE ({clause}){ext_sql}{folder_sql} ORDER BY f.modified DESC,f.id,c.id"
         );
         let patterns: Vec<String> = short_terms.iter().map(|term| like(term)).collect();
         let mut values: Vec<&dyn rusqlite::ToSql> = patterns.iter().map(|s| s as _).collect();
@@ -930,24 +1438,27 @@ fn keyword_search(
             values.push(pattern);
         }
         let mut stmt = db.prepare(&sql)?;
-        content_rows.extend(
-            stmt.query_map(params_from_iter(values), joined_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
-    }
-    content_rows.retain(|row| {
-        folder.is_none_or(|folder| {
-            row["path"]
-                .as_str()
-                .is_some_and(|path| folder_contains_path(folder, Path::new(path)))
-        })
-    });
-    let mut seen = HashSet::new();
-    for row in content_rows {
-        let id = row["id"].as_i64().unwrap_or_default();
-        if seen.insert(id) {
-            let text = row["text"].as_str().unwrap_or_default().to_string();
-            add_hit(hits, row, Some(text), seen.len(), "keyword", next_hit_order);
+        let mut rows = stmt.query(params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, i64>(0)?;
+            if seen_content_files.contains(&id) {
+                continue;
+            }
+            let path = row.get::<_, String>(2)?;
+            if folder.is_some_and(|folder| !folder_contains_path(folder, Path::new(&path))) {
+                continue;
+            }
+            seen_content_files.insert(id);
+            let file = joined_row(row)?;
+            let text = file["text"].as_str().unwrap_or_default().to_string();
+            add_hit(
+                hits,
+                file,
+                Some(text),
+                seen_content_files.len(),
+                "keyword",
+                next_hit_order,
+            );
         }
     }
     Ok(())
@@ -1032,7 +1543,6 @@ fn streaming_candidates(
     query: &[f32],
     extension: Option<&str>,
     folder: Option<&Path>,
-    file_limit: usize,
 ) -> Result<Vec<(f32, i64)>> {
     let mut sql = String::from(
         "SELECT c.id,c.file_id,c.vector,f.path FROM chunks c JOIN files f ON f.id=c.file_id
@@ -1060,7 +1570,7 @@ fn streaming_candidates(
         sql_values.push(pattern);
     }
     let mut rows = stmt.query(params_from_iter(sql_values))?;
-    let mut top = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
+    let mut best_by_file = HashMap::<i64, Candidate>::new();
     let mut current_file = None;
     let mut current_file_in_scope = true;
     let mut current_best: Option<Candidate> = None;
@@ -1070,7 +1580,9 @@ fn streaming_candidates(
         let raw: Vec<u8> = row.get(2)?;
         let path: String = row.get(3)?;
         if current_file.is_some_and(|previous| previous != file_id) {
-            retain(&mut top, current_best.take(), file_limit);
+            if let (Some(previous_id), Some(best)) = (current_file, current_best.take()) {
+                best_by_file.insert(previous_id, best);
+            }
             current_file_in_scope =
                 folder.is_none_or(|folder| folder_contains_path(folder, Path::new(&path)));
         } else if current_file.is_none() {
@@ -1096,27 +1608,15 @@ fn streaming_candidates(
             current_best = Some(candidate);
         }
     }
-    retain(&mut top, current_best, file_limit);
-    let mut ranked: Vec<_> = top
-        .into_iter()
-        .map(|std::cmp::Reverse(Candidate(score, id))| (score, id))
+    if let (Some(file_id), Some(best)) = (current_file, current_best) {
+        best_by_file.insert(file_id, best);
+    }
+    let mut ranked: Vec<_> = best_by_file
+        .into_values()
+        .map(|Candidate(score, id)| (score, id))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     Ok(ranked)
-}
-
-fn retain(
-    top: &mut BinaryHeap<std::cmp::Reverse<Candidate>>,
-    current: Option<Candidate>,
-    limit: usize,
-) {
-    let Some(candidate) = current else { return };
-    if top.len() < limit {
-        top.push(std::cmp::Reverse(candidate));
-    } else if top.peek().is_some_and(|worst| candidate > worst.0) {
-        top.pop();
-        top.push(std::cmp::Reverse(candidate));
-    }
 }
 
 fn dot(left: &[f32], right: &[f32]) -> f32 {
@@ -1233,6 +1733,9 @@ fn name_match_count(file: &Value, terms: &[String]) -> usize {
 }
 
 fn preview(text: &str, terms: &[String], limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
     let folded = text.to_lowercase();
     let start_char = terms
         .iter()
@@ -1244,10 +1747,18 @@ fn preview(text: &str, terms: &[String], limit: usize) -> String {
         .min()
         .unwrap_or(0)
         .saturating_sub(70);
-    let excerpt: String = text.chars().skip(start_char).take(limit).collect();
     let prefix = if start_char > 0 { "…" } else { "" };
-    let has_more = text.chars().count() > start_char + limit;
-    format!("{prefix}{excerpt}{}", if has_more { "…" } else { "" })
+    let prefix_len = prefix.chars().count();
+    let remaining = text.chars().count().saturating_sub(start_char);
+    let has_more = remaining > limit.saturating_sub(prefix_len);
+    let suffix = if has_more && limit > prefix_len {
+        "…"
+    } else {
+        ""
+    };
+    let excerpt_limit = limit.saturating_sub(prefix_len + suffix.chars().count());
+    let excerpt: String = text.chars().skip(start_char).take(excerpt_limit).collect();
+    format!("{prefix}{excerpt}{suffix}")
 }
 
 #[cfg(test)]
@@ -1333,6 +1844,57 @@ mod tests {
         store.replace_files(&[record]).unwrap();
     }
 
+    fn make_record(
+        library: &Path,
+        root_id: i64,
+        name: String,
+        passages: Vec<Passage>,
+        vectors: Option<Vec<Vec<f32>>>,
+        model_id: Option<String>,
+        modified: i64,
+    ) -> FileRecord {
+        let path = library.join(name);
+        std::fs::write(&path, b"fixture").unwrap();
+        FileRecord {
+            root_id,
+            path: crate::config::canonical(&path).unwrap(),
+            size: 7,
+            modified,
+            passages,
+            vectors,
+            model_id,
+            error: None,
+            reader_id: "test-v1".into(),
+            content_key: None,
+        }
+    }
+
+    fn search_all_pages(
+        search: &Search,
+        query: &str,
+        limit: usize,
+        extension: Option<&str>,
+        mode: &str,
+        folder: Option<&Path>,
+    ) -> Result<(Vec<Value>, Value)> {
+        let mut response = search.search_page(query, limit, extension, mode, folder, None)?;
+        let mut results = Vec::new();
+        loop {
+            results.extend(
+                response["results"]
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("test result was not an array"))?,
+            );
+            let Some(cursor) = response["next_cursor"].as_object() else {
+                return Ok((results, response));
+            };
+            let cursor: SearchPageCursor = serde_json::from_value(Value::Object(cursor.clone()))?;
+            response = search.search_page(query, limit, extension, mode, folder, Some(&cursor))?;
+            assert_eq!(response["reset_required"], false);
+        }
+    }
+
     #[test]
     fn korean_terms_fts_quoting_and_preview_are_stable() {
         assert_eq!(
@@ -1347,6 +1909,331 @@ mod tests {
         assert!(
             preview(&("x".repeat(200) + "보증금 반환"), &["보증금".into()], 20).starts_with('…')
         );
+    }
+
+    #[test]
+    fn search_pages_return_every_filename_and_body_match_past_legacy_caps() -> Result<()> {
+        let (_temp, store, library, root_id) = fixture();
+        let mut records = Vec::new();
+        for index in 0..550 {
+            records.push(make_record(
+                &library,
+                root_id,
+                format!("needle-name-{index:04}.txt"),
+                Vec::new(),
+                None,
+                None,
+                index,
+            ));
+        }
+        for index in 0..505 {
+            let passages = if index == 0 {
+                (0..405)
+                    .map(|chunk| Passage {
+                        text: format!("needle body match chunk {chunk}"),
+                        location: format!("본문 {chunk}"),
+                    })
+                    .collect()
+            } else {
+                vec![Passage {
+                    text: format!("needle body match file {index}"),
+                    location: "본문".into(),
+                }]
+            };
+            records.push(make_record(
+                &library,
+                root_id,
+                format!("body-{index:04}.txt"),
+                passages,
+                None,
+                None,
+                1000 + index,
+            ));
+        }
+        store.replace_files(&records)?;
+        let engine = Arc::new(FixtureEngine::new("google-a"));
+        let search = Search::new(store, engine.clone());
+        let (results, last) = search_all_pages(&search, "needle", 200, None, "keyword", None)?;
+        assert_eq!(last["total"], 1055);
+        assert_eq!(results.len(), 1055);
+        let ids: HashSet<_> = results
+            .iter()
+            .map(|result| result["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1055);
+        assert!(results.iter().all(|result| {
+            result.get("text").is_none()
+                && result["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.chars().count() <= 360)
+        }));
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["name"].as_str().unwrap().starts_with("body-"))
+                .count(),
+            505
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["name"].as_str().unwrap().starts_with("needle-name-"))
+                .count(),
+            550
+        );
+        let legacy = search.search("needle", 30, None, "keyword")?;
+        assert_eq!(legacy["results"].as_array().unwrap().len(), 30);
+        assert!(
+            legacy["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result.get("text").is_none())
+        );
+        assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_code_search_pages_have_no_three_hundred_file_limit() -> Result<()> {
+        let (_temp, store, library, root_id) = fixture();
+        let records = (0..325)
+            .map(|index| {
+                make_record(
+                    &library,
+                    root_id,
+                    format!("module-{index:04}.rs"),
+                    vec![Passage {
+                        text: "generic fixture content".into(),
+                        location: "본문".into(),
+                    }],
+                    None,
+                    None,
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.replace_files(&records)?;
+        let engine = Arc::new(FixtureEngine::new("google-a"));
+        let search = Search::new(store, engine.clone());
+        let (results, last) = search_all_pages(&search, "source code", 100, None, "hybrid", None)?;
+        assert_eq!(last["total"], 325);
+        assert_eq!(results.len(), 325);
+        assert_eq!(last["intent"], "source_code");
+        assert!(
+            results
+                .iter()
+                .all(|result| result["match_type"].as_str().unwrap().contains("filetype"))
+        );
+        assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_search_pages_keep_all_qualified_files_and_embed_once() -> Result<()> {
+        let (_temp, store, library, root_id) = fixture();
+        let mut records = Vec::new();
+        for index in 0..520 {
+            records.push(make_record(
+                &library,
+                root_id,
+                format!("semantic-{index:04}.txt"),
+                vec![Passage {
+                    text: "generic fixture passage".into(),
+                    location: "본문".into(),
+                }],
+                Some(vec![vec![1.0, 0.0]]),
+                Some("google-a".into()),
+                index,
+            ));
+        }
+        for index in 0..25 {
+            records.push(make_record(
+                &library,
+                root_id,
+                format!("weak-{index:04}.txt"),
+                vec![Passage {
+                    text: "generic fixture passage".into(),
+                    location: "본문".into(),
+                }],
+                Some(vec![vec![0.69, 0.7235383]]),
+                Some("google-a".into()),
+                1000 + index,
+            ));
+        }
+        store.replace_files(&records)?;
+        for cache_limit in [0, 1024 * 1024] {
+            let engine = Arc::new(FixtureEngine::new("google-a"));
+            let search = Search::with_cache_limit(store.clone(), engine.clone(), cache_limit);
+            let (results, last) = search_all_pages(
+                &search,
+                "unmatched orbital question",
+                100,
+                None,
+                "hybrid",
+                None,
+            )?;
+            assert_eq!(last["total"], 520);
+            assert_eq!(results.len(), 520);
+            assert_eq!(results[0]["name"], "semantic-0519.txt");
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result["name"].as_str().unwrap().starts_with("semantic-"))
+            );
+            assert_eq!(engine.embeddings.load(AtomicOrdering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn search_page_cursors_bind_scope_filters_and_lexical_revision_only() -> Result<()> {
+        let (_temp, store, library, root_id) = fixture();
+        let scope = library.join("scope");
+        std::fs::create_dir_all(scope.join("sub"))?;
+        std::fs::create_dir_all(library.join("outside"))?;
+        let mut records = Vec::new();
+        for (relative, name, modified) in [
+            ("scope/needle-a.txt", "needle-a.txt", 1),
+            ("scope/sub/needle-b.txt", "needle-b.txt", 2),
+            ("scope/needle-c.txt", "needle-c.txt", 3),
+            ("outside/needle-d.txt", "needle-d.txt", 4),
+        ] {
+            let path = library.join(relative);
+            std::fs::write(&path, b"fixture").unwrap();
+            records.push(FileRecord {
+                root_id,
+                path: crate::config::canonical(&path)?,
+                size: 7,
+                modified,
+                passages: vec![Passage {
+                    text: "needle content".into(),
+                    location: "본문".into(),
+                }],
+                vectors: Some(vec![vec![1.0, 0.0]]),
+                model_id: Some("google-a".into()),
+                error: None,
+                reader_id: "test-v1".into(),
+                content_key: None,
+            });
+            assert_eq!(path.file_name().unwrap(), name);
+        }
+        store.replace_files(&records)?;
+        let search = Search::new(store.clone(), Arc::new(FixtureEngine::new("google-a")));
+        let first = search.search_page("needle", 1, Some("TXT"), "keyword", Some(&scope), None)?;
+        assert_eq!(first["total"], 3);
+        let cursor: SearchPageCursor = serde_json::from_value(first["next_cursor"].clone())?;
+
+        let mode_changed = search.search_page(
+            "needle",
+            1,
+            Some("TXT"),
+            "instant",
+            Some(&scope),
+            Some(&cursor),
+        )?;
+        assert_eq!(mode_changed["reset_required"], true);
+        let filter_changed = search.search_page(
+            "needle",
+            1,
+            Some("pdf"),
+            "keyword",
+            Some(&scope),
+            Some(&cursor),
+        )?;
+        assert_eq!(filter_changed["reset_required"], true);
+
+        store.update_settings(&json!({"filename_only_dirs":"_site,temp,vendor,generated"}))?;
+        let policy_changed = search.search_page(
+            "needle",
+            1,
+            Some("TXT"),
+            "keyword",
+            Some(&scope),
+            Some(&cursor),
+        )?;
+        assert_eq!(policy_changed["reset_required"], true);
+        store.update_settings(&json!({"filename_only_dirs":"_site,temp,vendor"}))?;
+        store.update_settings(&json!({"context_size":2048}))?;
+        let settings_changed = search.search_page(
+            "needle",
+            1,
+            Some("TXT"),
+            "keyword",
+            Some(&scope),
+            Some(&cursor),
+        )?;
+        assert_eq!(settings_changed["reset_required"], true);
+        store.update_settings(&json!({"context_size":4096}))?;
+
+        let db = store.connect()?;
+        db.execute(
+            "UPDATE chunks SET vector=?1 WHERE file_id=(SELECT id FROM files WHERE name='needle-a.txt')",
+            rusqlite::params![crate::store::encode_vector(&[0.0, 1.0])],
+        )?;
+        drop(db);
+        let page = search.search_page(
+            "needle",
+            1,
+            Some("txt"),
+            "keyword",
+            Some(&scope),
+            Some(&cursor),
+        )?;
+        assert_eq!(page["reset_required"], false);
+        assert_eq!(page["results"].as_array().unwrap().len(), 1);
+        let next: SearchPageCursor = serde_json::from_value(page["next_cursor"].clone())?;
+        let db = store.connect()?;
+        db.execute(
+            "UPDATE files SET name='renamed-needle-c.txt' WHERE name='needle-c.txt'",
+            [],
+        )?;
+        drop(db);
+        let reset = search.search_page(
+            "needle",
+            1,
+            Some("txt"),
+            "keyword",
+            Some(&scope),
+            Some(&next),
+        )?;
+        assert_eq!(reset["reset_required"], true);
+        assert!(reset["results"].as_array().unwrap().is_empty());
+        assert!(reset["next_cursor"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn spilled_search_page_snapshot_reads_checkpointed_pages() -> Result<()> {
+        let (temp, _, _, _) = fixture();
+        let entries = (0..300)
+            .map(|id| SearchPageEntry {
+                id,
+                score: id as f64,
+                match_type: "keyword".into(),
+                snippet: format!("요약 {id}"),
+                location: "본문".into(),
+                semantic_score: None,
+            })
+            .collect();
+        let (entries, estimated_bytes) =
+            store_search_page_entries_with_budget(temp.path(), entries, 0)?;
+        assert!(estimated_bytes > 0);
+        let snapshot = SearchPageSnapshot {
+            signature: 0,
+            revision: 1,
+            mode: "keyword".into(),
+            intent: None,
+            warnings: Vec::new(),
+            total: 300,
+            entries,
+            estimated_bytes,
+        };
+        let page = snapshot.page(127, 130)?;
+        assert_eq!(page.first().unwrap().id, 127);
+        assert_eq!(page.last().unwrap().id, 256);
+        assert_eq!(page.len(), 130);
+        Ok(())
     }
 
     #[test]
@@ -1380,11 +2267,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            snapshot.candidates(&[1.0, 0.0], None, None, 10),
+            snapshot.candidates(&[1.0, 0.0], None, None),
             vec![(1.0, 1), (0.8, 3)]
         );
         assert_eq!(
-            snapshot.candidates(&[1.0, 0.0], Some(".pdf"), None, 10),
+            snapshot.candidates(&[1.0, 0.0], Some(".pdf"), None),
             vec![(0.8, 3)]
         );
     }

@@ -141,8 +141,9 @@ pub fn run(store: Arc<Store>, engine: Arc<EmbeddedEngine>, folder: Option<PathBu
                 }
                 let boot = matches!(command, Command::Status {});
                 let uses_model = matches!(&command, Command::Answer(_))
-                    || matches!(&command, Command::Search(input) if input.mode == "hybrid");
-                let generation = matches!(&command, Command::Search(_) | Command::ListFiles(_))
+                    || matches!(&command, Command::Search(input) if input.mode == "hybrid")
+                    || matches!(&command, Command::SearchPage(input) if input.mode == "hybrid" && input.cursor.is_none());
+                let generation = matches!(&command, Command::Search(_) | Command::SearchPage(_) | Command::ListFiles(_))
                     .then(|| {
                         let counter = window.search_generation.clone();
                         let expected = counter.fetch_add(1, Ordering::AcqRel) + 1;

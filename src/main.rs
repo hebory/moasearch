@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use moasearch::{
-    commands::{Command as AppCommand, ListCursor, ListFilesInput, SearchInput},
+    commands::{Command as AppCommand, ListCursor, ListFilesInput, SearchInput, SearchPageInput},
     config,
     engine::EmbeddedEngine,
     models, ocr,
@@ -11,7 +11,13 @@ use moasearch::{
     store::Store,
 };
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    io::{BufWriter, Seek, SeekFrom, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 #[cfg(windows)]
 mod desktop;
 mod launcher;
@@ -92,6 +98,112 @@ enum ModelCommand {
 fn emit(value: Value) {
     println!("{}", serde_json::to_string_pretty(&value).unwrap());
 }
+
+fn write_spooled_output<W: Write>(
+    data_dir: &std::path::Path,
+    output: &mut W,
+    produce: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
+    let mut spool = tempfile::tempfile_in(data_dir)?;
+    produce(&mut spool)?;
+    spool.flush()?;
+    spool.seek(SeekFrom::Start(0))?;
+    std::io::copy(&mut spool, output)?;
+    output.flush()?;
+    Ok(())
+}
+
+// Keep one search session while streaming every page, rather than collecting
+// an unbounded result array or exposing a process-local cursor to another CLI.
+// The completed JSON is spooled to disk so a stale cursor cannot leave partial
+// JSON on stdout.
+fn emit_search_pages(
+    services: Arc<AppServices>,
+    query: String,
+    mode: String,
+    folder: Option<PathBuf>,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    write_spooled_output(&services.store.data_dir, &mut output, |spool| {
+        let mut spool_output = BufWriter::new(spool);
+        let mut cursor = None;
+        let mut metadata = None;
+        let mut cursors = std::collections::HashSet::new();
+        let mut first_row = true;
+        write!(spool_output, "{{\"results\":[")?;
+        loop {
+            let page = services.execute(AppCommand::SearchPage(SearchPageInput {
+                query: query.clone(),
+                limit: 200,
+                extension: None,
+                mode: mode.clone(),
+                folder: folder.clone(),
+                cursor: cursor.take(),
+            }))?;
+            anyhow::ensure!(
+                page["reset_required"] != true,
+                "검색 결과가 변경됐습니다. 다시 검색하세요."
+            );
+            if metadata.is_none() {
+                metadata = page.as_object().map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| !matches!(key.as_str(), "results" | "next_cursor"))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<serde_json::Map<_, _>>()
+                });
+            }
+            for row in page["results"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("검색 응답 형식 오류"))?
+            {
+                if !first_row {
+                    write!(spool_output, ",")?;
+                }
+                serde_json::to_writer(&mut spool_output, row)?;
+                first_row = false;
+            }
+            if page["next_cursor"].is_null() {
+                break;
+            }
+            anyhow::ensure!(
+                cursors.insert(serde_json::to_string(&page["next_cursor"])?),
+                "검색 페이지가 반복됩니다."
+            );
+            cursor = serde_json::from_value(page["next_cursor"].clone())?;
+        }
+        write!(spool_output, "]")?;
+        for (key, value) in metadata.unwrap_or_default() {
+            write!(spool_output, ",")?;
+            serde_json::to_writer(&mut spool_output, &key)?;
+            write!(spool_output, ":")?;
+            serde_json::to_writer(&mut spool_output, &value)?;
+        }
+        writeln!(spool_output, ",\"next_cursor\":null}}")?;
+        spool_output.flush()?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_spooled_output;
+    use std::io::Write;
+
+    #[test]
+    fn failed_search_spool_leaves_stdout_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut output = Vec::new();
+        let result = write_spooled_output(temp.path(), &mut output, |spool| {
+            spool.write_all(b"{\"results\":[partial")?;
+            anyhow::bail!("후속 페이지에서 검색이 중단됐습니다.");
+        });
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+}
+
 fn run() -> Result<()> {
     let args = Cli::parse();
     let store = Arc::new(Store::open(&args.data_dir)?);
@@ -159,15 +271,12 @@ fn run() -> Result<()> {
             query,
             keyword,
             folder,
-        } => emit(
-            AppServices::new(store, engine).execute(AppCommand::Search(SearchInput {
-                query,
-                limit: 30,
-                extension: None,
-                mode: if keyword { "keyword" } else { "hybrid" }.into(),
-                folder,
-            }))?,
-        ),
+        } => emit_search_pages(
+            AppServices::new(store, engine),
+            query,
+            if keyword { "keyword" } else { "hybrid" }.into(),
+            folder,
+        )?,
         Command::Files {
             limit,
             folder,

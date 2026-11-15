@@ -102,6 +102,17 @@ impl AppServices {
                     input.folder.as_deref(),
                 )
             }
+            Command::SearchPage(input) => {
+                input.validate()?;
+                self.search.search_page(
+                    &input.query,
+                    input.limit,
+                    input.extension.as_deref(),
+                    &input.mode,
+                    input.folder.as_deref(),
+                    input.cursor.as_ref(),
+                )
+            }
             Command::ListFiles(input) => {
                 input.validate()?;
                 let extension = input

@@ -66,7 +66,7 @@ pub(super) fn source_code_files(
         sql.push_str(" AND f.path LIKE ? ESCAPE '\\' COLLATE NOCASE");
         values.push(scope_like(folder));
     }
-    sql.push_str(" ORDER BY f.modified DESC,f.id DESC LIMIT 300");
+    sql.push_str(" ORDER BY f.modified DESC,f.id DESC");
 
     let mut statement = db.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
@@ -169,6 +169,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn source_code_listing_has_no_legacy_three_hundred_file_cap() {
+        let db = database();
+        let root = Path::new("C:/fixture");
+        for id in 1..=350 {
+            insert_file(&db, id, &root.join(format!("module-{id:04}.rs")), id);
+        }
+        let files = source_code_files(&db, None, None).unwrap();
+        assert_eq!(files.len(), 350);
+        assert_eq!(files[0]["name"], "module-0350.rs");
+        assert_eq!(files[349]["name"], "module-0001.rs");
     }
 
     #[test]
